@@ -6,7 +6,7 @@
   <meta name="theme-color" content="#0f0f0f" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
-  <title>CleanTube Music — Ad-Free Player</title>
+  <title>CleanTube Music — Player & Heavy Rotation</title>
   <style>
     :root {
       --bg-primary: #0f0f0f;
@@ -175,37 +175,14 @@
       box-shadow: 0 8px 30px rgba(0, 0, 0, 0.5);
     }
 
-    video {
+    video,
+    #ytEmbedContainer,
+    #ytEmbedContainer iframe {
       width: 100%;
       height: 100%;
       display: block;
+      border: none;
       background: #000;
-    }
-
-    .audio-mode-overlay {
-      position: absolute;
-      inset: 0;
-      background: rgba(15, 15, 15, 0.92);
-      display: none;
-      flex-direction: column;
-      align-items: center;
-      justify-content: center;
-      padding: 1.5rem;
-      text-align: center;
-      gap: 0.75rem;
-      pointer-events: none;
-    }
-
-    .audio-mode-overlay.active {
-      display: flex;
-    }
-
-    .audio-mode-overlay img {
-      width: 140px;
-      height: 140px;
-      object-fit: cover;
-      border-radius: 12px;
-      box-shadow: 0 4px 20px rgba(0, 0, 0, 0.6);
     }
 
     .meta-card {
@@ -277,6 +254,7 @@
     .toggles-group {
       display: flex;
       flex-wrap: wrap;
+      align-items: center;
       gap: 1rem;
     }
 
@@ -493,20 +471,15 @@
   </nav>
 
   <main class="container">
-    <!-- Left Column: Media Player -->
+    <!-- Left Column: Hybrid Media Player -->
     <section class="player-section">
       <div class="video-stage">
-        <video id="videoPlayer" controls playsinline preload="metadata"></video>
-
-        <div class="audio-mode-overlay" id="audioOverlay">
-          <img id="overlayThumb" src="" alt="Track Artwork" />
-          <div style="font-weight: 600; color: var(--accent);">Audio-Only / Background Music Mode</div>
-          <div style="font-size: 0.82rem; color: var(--text-secondary);">
-            Uninterrupted lock-screen playback active
-          </div>
-        </div>
-
+        <!-- Direct Stream Player (Used when direct stream is available) -->
+        <video id="videoPlayer" controls playsinline preload="metadata" style="display: none;"></video>
         <audio id="bgAudioPlayer" preload="metadata" style="display: none;"></audio>
+
+        <!-- Embedded Player Container (Used automatically on Cloud/Render when datacenter IP is blocked) -->
+        <div id="ytEmbedContainer"></div>
       </div>
 
       <div class="meta-card">
@@ -527,13 +500,10 @@
               <span>✨ Autoplay Similar</span>
             </label>
             <label class="toggle-label">
-              <input type="checkbox" id="audioOnlyToggle" />
-              <span>Audio-Only Mode</span>
-            </label>
-            <label class="toggle-label">
               <input type="checkbox" id="repeatToggle" />
-              <span>Repeat Song</span>
+              <span>🔁 Repeat Song</span>
             </label>
+            <button class="btn btn-sm" id="skipNextBtn">⏭ Next Similar</button>
           </div>
           <span class="status-pill" id="playbackStatus">Idle</span>
         </div>
@@ -561,6 +531,7 @@
     </aside>
   </main>
 
+  <script src="https://www.youtube.com/iframe_api"></script>
   <script src="/app.js"></script>
 </body>
 </html>

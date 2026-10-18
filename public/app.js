@@ -5,16 +5,15 @@ const searchBtn = document.getElementById('searchBtn');
 
 const videoPlayer = document.getElementById('videoPlayer');
 const bgAudioPlayer = document.getElementById('bgAudioPlayer');
-const audioOverlay = document.getElementById('audioOverlay');
-const overlayThumb = document.getElementById('overlayThumb');
+const ytEmbedContainer = document.getElementById('ytEmbedContainer');
 
 const currentTitle = document.getElementById('currentTitle');
 const currentUploader = document.getElementById('currentUploader');
 const streamSourceBadge = document.getElementById('streamSourceBadge');
 const favBtn = document.getElementById('favBtn');
 const autoplaySimilarToggle = document.getElementById('autoplaySimilarToggle');
-const audioOnlyToggle = document.getElementById('audioOnlyToggle');
 const repeatToggle = document.getElementById('repeatToggle');
+const skipNextBtn = document.getElementById('skipNextBtn');
 const playbackStatus = document.getElementById('playbackStatus');
 
 const tabButtons = document.querySelectorAll('.tab-btn');
@@ -25,29 +24,89 @@ const resultsList = document.getElementById('resultsList');
 
 // Application State
 let currentStream = null;
-let activeTab = 'mostPlayed'; // 'mostPlayed' | 'similar' | 'favorites' | 'search'
+let activeTab = 'mostPlayed';
+let activeEngine = 'embed'; // 'direct' | 'embed'
+let ytPlayer = null;
+let ytApiReady = false;
 
 let mostPlayedList = [];
 let favoritesList = [];
 let similarList = [];
 let searchResultsList = [];
 
-// Active Playback Queue & Session History (prevents Autoplay from looping the same 2 songs)
 let playbackQueue = [];
 let currentQueueIndex = -1;
-let isCustomQueueActive = false; // true when user explicitly clicks "Play All" or "Shuffle"
 const recentlyPlayedIds = [];
-let isBackgroundAudioActive = false;
 
-// Restore saved toggle states
 if (localStorage.getItem('cleantube_autoplay_similar') !== null) {
   autoplaySimilarToggle.checked = localStorage.getItem('cleantube_autoplay_similar') === 'true';
 }
-if (localStorage.getItem('cleantube_audio_only') === 'true') {
-  audioOnlyToggle.checked = true;
-}
 if (localStorage.getItem('cleantube_repeat') === 'true') {
   repeatToggle.checked = true;
+}
+
+// Initialize YouTube IFrame API for Cloud/Render playback
+window.onYouTubeIframeAPIReady = function () {
+  ytApiReady = true;
+};
+
+function ensureYtPlayer(videoId) {
+  return new Promise((resolve) => {
+    if (ytPlayer && typeof ytPlayer.loadVideoById === 'function') {
+      ytPlayer.loadVideoById(videoId);
+      return resolve(ytPlayer);
+    }
+
+    const create = () => {
+      ytPlayer = new YT.Player('ytEmbedContainer', {
+        height: '100%',
+        width: '100%',
+        videoId,
+        host: 'https://www.youtube-nocookie.com',
+        playerVars: {
+          autoplay: 1,
+          playsinline: 1,
+          rel: 0,
+          modestbranding: 1
+        },
+        events: {
+          onReady: (event) => {
+            event.target.playVideo();
+            resolve(ytPlayer);
+          },
+          onStateChange: (event) => {
+            // YT.PlayerState.ENDED === 0
+            if (event.data === 0) {
+              handleTrackEnded();
+            } else if (event.data === 1) {
+              playbackStatus.textContent = 'Playing';
+              if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'playing';
+            } else if (event.data === 2) {
+              playbackStatus.textContent = 'Paused';
+              if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'paused';
+            }
+          },
+          onError: () => {
+            // If a video restricts embedding, automatically skip to the next similar track
+            playbackStatus.textContent = 'Track restricted — skipping to similar song...';
+            setTimeout(() => playNextTrackOrSimilar(), 800);
+          }
+        }
+      });
+    };
+
+    if (ytApiReady && window.YT && window.YT.Player) {
+      create();
+    } else {
+      const checkInterval = setInterval(() => {
+        if (window.YT && window.YT.Player) {
+          clearInterval(checkInterval);
+          ytApiReady = true;
+          create();
+        }
+      }, 150);
+    }
+  });
 }
 
 function rememberPlayedId(id) {
@@ -60,16 +119,22 @@ function rememberPlayedId(id) {
   }
 }
 
-function isDirectVideoReference(input) {
+function extractVideoId(input) {
+  if (!input) return null;
   const trimmed = input.trim();
   const urlPattern = /(?:youtube\.com\/(?:[^\/]+\/.+\/|(?:v|e(?:mbed)?|shorts)\/|.*[?&]v=)|youtu\.be\/)([^"&?\/\s]{11})/;
-  if (urlPattern.test(trimmed)) return true;
-  if (/^[a-zA-Z0-9_-]{11}$/.test(trimmed)) return true;
-  return false;
+  const match = trimmed.match(urlPattern);
+  if (match && match[1]) return match[1];
+  if (/^[a-zA-Z0-9_-]{11}$/.test(trimmed)) return trimmed;
+  return null;
+}
+
+function isDirectVideoReference(input) {
+  return Boolean(extractVideoId(input));
 }
 
 function formatDuration(seconds) {
-  if (!seconds || isNaN(seconds) || seconds <= 0) return 'LIVE';
+  if (!seconds || isNaN(seconds) || seconds <= 0) return '';
   const hrs = Math.floor(seconds / 3600);
   const mins = Math.floor((seconds % 3600) / 60);
   const secs = Math.floor(seconds % 60);
@@ -80,13 +145,10 @@ function formatDuration(seconds) {
   return `${mins}:${String(secs).padStart(2, '0')}`;
 }
 
-function getActiveMediaElement() {
-  return isBackgroundAudioActive ? bgAudioPlayer : videoPlayer;
-}
+// ============================================================================
+// Library, Tabs, Search & Playback
+// ============================================================================
 
-/**
- * Fetches Most Played & Favorites from the server
- */
 async function fetchLibrary() {
   try {
     const res = await fetch('/api/library');
@@ -98,25 +160,18 @@ async function fetchLibrary() {
     if (activeTab === 'mostPlayed' || activeTab === 'favorites') {
       renderCurrentTabList();
     }
-  } catch (err) {
-    console.warn('Could not load library:', err);
-  }
+  } catch (_) {}
 }
 
-/**
- * Fetches Similar / Recommended songs in the background if not already provided
- */
 async function fetchSimilarTracks(streamData) {
   if (!streamData || !streamData.id) return;
 
-  // If Piped already returned related videos with the stream, use them immediately
   if (Array.isArray(streamData.related) && streamData.related.length > 0) {
     similarList = streamData.related;
     if (activeTab === 'similar') renderCurrentTabList();
     return;
   }
 
-  // Otherwise query /api/related/:id (uses Piped or yt-dlp YouTube Radio Mix RD<id>)
   try {
     const fallbackQuery = `${streamData.uploader || ''} ${streamData.title || ''}`.trim();
     const res = await fetch(
@@ -128,14 +183,9 @@ async function fetchSimilarTracks(streamData) {
       similarList = data.related;
       if (activeTab === 'similar') renderCurrentTabList();
     }
-  } catch (err) {
-    console.warn('Could not fetch similar tracks:', err);
-  }
+  } catch (_) {}
 }
 
-/**
- * Records a play in the server's Most Watched library
- */
 async function recordTrackPlay(streamData) {
   try {
     const res = await fetch('/api/library/record', {
@@ -149,15 +199,10 @@ async function recordTrackPlay(streamData) {
         thumbnailUrl: streamData.thumbnailUrl
       })
     });
-    if (res.ok) {
-      await fetchLibrary();
-    }
+    if (res.ok) await fetchLibrary();
   } catch (_) {}
 }
 
-/**
- * Toggles Favorite status on the currently playing track
- */
 favBtn.addEventListener('click', async () => {
   if (!currentStream) return;
   try {
@@ -189,9 +234,6 @@ async function removeTrackFromLibrary(videoId, event) {
   } catch (_) {}
 }
 
-/**
- * Switch Sidebar Tabs
- */
 function switchTab(tabName) {
   activeTab = tabName;
   tabButtons.forEach((btn) => {
@@ -251,12 +293,13 @@ function renderCurrentTabList() {
 
     const showPlayCount = item.playCount && item.playCount > 0;
     const isLibraryTab = activeTab === 'mostPlayed' || activeTab === 'favorites';
+    const durText = formatDuration(item.duration);
 
     card.innerHTML = `
       <div class="thumb-wrapper">
         <img src="${item.thumbnailUrl}" alt="" loading="lazy" />
         ${showPlayCount ? `<span class="play-count-badge">Played ${item.playCount}x</span>` : ''}
-        <span class="duration-badge">${formatDuration(item.duration)}</span>
+        ${durText ? `<span class="duration-badge">${durText}</span>` : ''}
       </div>
       <div class="result-info">
         <div class="result-title"></div>
@@ -277,8 +320,6 @@ function renderCurrentTabList() {
     card.addEventListener('click', () => {
       playbackQueue = [...list];
       currentQueueIndex = index;
-      // If user clicked a song inside Most Played or Favorites, keep that list as fallback queue
-      isCustomQueueActive = false;
       loadAndPlayStream(item.id);
     });
 
@@ -286,15 +327,11 @@ function renderCurrentTabList() {
   });
 }
 
-/**
- * Play All & Shuffle Buttons explicitly lock in the current tab's playlist
- */
 playAllBtn.addEventListener('click', () => {
   const list = getVisibleList();
   if (list.length === 0) return;
   playbackQueue = [...list];
   currentQueueIndex = 0;
-  isCustomQueueActive = true;
   loadAndPlayStream(playbackQueue[0].id);
 });
 
@@ -308,9 +345,12 @@ shuffleBtn.addEventListener('click', () => {
   }
   playbackQueue = shuffled;
   currentQueueIndex = 0;
-  isCustomQueueActive = true;
   playbackStatus.textContent = 'Shuffling Queue';
   loadAndPlayStream(playbackQueue[0].id);
+});
+
+skipNextBtn.addEventListener('click', () => {
+  playNextTrackOrSimilar();
 });
 
 async function performSearch(query) {
@@ -337,7 +377,7 @@ async function performSearch(query) {
 }
 
 /**
- * Resolves direct stream URLs, starts playback, increments play count, and loads similar songs
+ * Loads and plays a song using either Direct Stream or the Instant Cloud Embed Engine
  */
 async function loadAndPlayStream(queryOrId) {
   searchBtn.disabled = true;
@@ -347,44 +387,52 @@ async function loadAndPlayStream(queryOrId) {
     const response = await fetch(`/api/stream/${encodeURIComponent(queryOrId)}`);
     const data = await response.json();
 
-    if (!response.ok) throw new Error(data.error || 'Failed to resolve stream');
+    if (!response.ok) {
+      throw new Error(data.error || 'Failed to load track');
+    }
 
     currentStream = data;
     rememberPlayedId(data.id);
 
     currentTitle.textContent = data.title || 'Untitled Track';
     currentUploader.textContent = data.uploader || 'Unknown Artist';
-    streamSourceBadge.textContent = `Resolver: ${data.source}`;
+    streamSourceBadge.textContent = `Engine: ${data.source}`;
     favBtn.classList.toggle('active', Boolean(data.favorite));
-
-    videoPlayer.poster = data.thumbnailUrl || '';
-    overlayThumb.src = data.thumbnailUrl || '';
 
     document.querySelectorAll('.result-item').forEach((el) => {
       el.classList.toggle('playing', el.dataset.id === data.id);
     });
 
-    const primaryVideoSrc = data.videoUrl || data.audioUrl;
-    const primaryAudioSrc = data.audioUrl || data.videoUrl;
-
-    videoPlayer.src = primaryVideoSrc;
-    bgAudioPlayer.src = primaryAudioSrc;
-
     configureMediaSession(data);
     recordTrackPlay(data);
 
-    // Fetch similar/recommended songs in the background for Autoplay
     similarList = [];
     fetchSimilarTracks(data);
 
-    const shouldUseAudioMode = audioOnlyToggle.checked || document.visibilityState === 'hidden';
-    isBackgroundAudioActive = false;
+    // Choose playback engine based on whether direct stream URLs were available
+    if (data.playbackMode === 'direct' && (data.videoUrl || data.audioUrl)) {
+      activeEngine = 'direct';
+      if (ytPlayer && typeof ytPlayer.stopVideo === 'function') {
+        ytPlayer.stopVideo();
+      }
+      ytEmbedContainer.style.display = 'none';
+      videoPlayer.style.display = 'block';
 
-    if (shouldUseAudioMode) {
-      activateBackgroundAudio(0, true);
-    } else {
-      audioOverlay.classList.remove('active');
+      videoPlayer.poster = data.thumbnailUrl || '';
+      videoPlayer.src = data.videoUrl || data.audioUrl;
+      bgAudioPlayer.src = data.audioUrl || data.videoUrl;
+
       await videoPlayer.play();
+      playbackStatus.textContent = 'Playing Direct Stream';
+    } else {
+      // Cloud / Render Instant Embed Mode
+      activeEngine = 'embed';
+      videoPlayer.pause();
+      bgAudioPlayer.pause();
+      videoPlayer.style.display = 'none';
+      ytEmbedContainer.style.display = 'block';
+
+      await ensureYtPlayer(data.id);
       playbackStatus.textContent = 'Playing';
     }
   } catch (err) {
@@ -394,12 +442,23 @@ async function loadAndPlayStream(queryOrId) {
   }
 }
 
-/**
- * Smart Next Track / Autoplay Similar Handler
- * Triggered when a song ends or when the user taps "Next" on the lock screen.
- */
+function handleTrackEnded() {
+  if (repeatToggle.checked && currentStream) {
+    if (activeEngine === 'embed' && ytPlayer) {
+      ytPlayer.seekTo(0);
+      ytPlayer.playVideo();
+    } else {
+      videoPlayer.currentTime = 0;
+      videoPlayer.play();
+    }
+    recordTrackPlay(currentStream);
+    return;
+  }
+
+  playNextTrackOrSimilar();
+}
+
 async function playNextTrackOrSimilar() {
-  // 1. If "Autoplay Similar" is enabled, pick the top unplayed similar recommendation
   if (autoplaySimilarToggle.checked && currentStream) {
     if (similarList.length === 0) {
       playbackStatus.textContent = 'Finding similar song...';
@@ -407,19 +466,17 @@ async function playNextTrackOrSimilar() {
     }
 
     if (similarList.length > 0) {
-      // Pick the first recommended song that hasn't been played recently in this session
       const nextSimilar =
         similarList.find((item) => !recentlyPlayedIds.includes(item.id)) || similarList[0];
 
       if (nextSimilar && nextSimilar.id) {
-        playbackStatus.textContent = `Autoplaying Similar: ${nextSimilar.title}`;
+        playbackStatus.textContent = `Up Next: ${nextSimilar.title}`;
         await loadAndPlayStream(nextSimilar.id);
         return;
       }
     }
   }
 
-  // 2. Fallback: Advance through the user's current queue (Most Played / Favorites / Search)
   if (playbackQueue.length === 0) {
     playbackQueue = [...getVisibleList()];
   }
@@ -431,85 +488,8 @@ async function playNextTrackOrSimilar() {
   }
 }
 
-function activateBackgroundAudio(resumeTime = videoPlayer.currentTime, autoPlay = !videoPlayer.paused) {
-  if (!currentStream || isBackgroundAudioActive) return;
-  isBackgroundAudioActive = true;
-
-  videoPlayer.pause();
-
-  if (Math.abs(bgAudioPlayer.currentTime - resumeTime) > 0.5) {
-    bgAudioPlayer.currentTime = resumeTime || 0;
-  }
-
-  audioOverlay.classList.add('active');
-
-  if (autoPlay) {
-    bgAudioPlayer
-      .play()
-      .then(() => {
-        playbackStatus.textContent = 'Background Audio Active';
-      })
-      .catch((err) => {
-        playbackStatus.textContent = `Tap Play: ${err.message}`;
-      });
-  } else {
-    playbackStatus.textContent = 'Paused (Audio Mode)';
-  }
-}
-
-function activateForegroundVideo(resumeTime = bgAudioPlayer.currentTime, autoPlay = !bgAudioPlayer.paused) {
-  if (!currentStream || !isBackgroundAudioActive || audioOnlyToggle.checked) return;
-  isBackgroundAudioActive = false;
-
-  bgAudioPlayer.pause();
-
-  if (Math.abs(videoPlayer.currentTime - resumeTime) > 0.5) {
-    videoPlayer.currentTime = resumeTime || 0;
-  }
-
-  audioOverlay.classList.remove('active');
-
-  if (autoPlay) {
-    videoPlayer
-      .play()
-      .then(() => {
-        playbackStatus.textContent = 'Playing Video';
-      })
-      .catch(() => {
-        playbackStatus.textContent = 'Paused';
-      });
-  } else {
-    playbackStatus.textContent = 'Paused';
-  }
-}
-
-document.addEventListener('visibilitychange', () => {
-  if (!currentStream) return;
-
-  if (document.visibilityState === 'hidden') {
-    const pos = isBackgroundAudioActive ? bgAudioPlayer.currentTime : videoPlayer.currentTime;
-    const playing = isBackgroundAudioActive ? !bgAudioPlayer.paused : !videoPlayer.paused;
-    activateBackgroundAudio(pos, playing);
-  } else if (document.visibilityState === 'visible') {
-    const pos = bgAudioPlayer.currentTime;
-    const playing = !bgAudioPlayer.paused;
-    activateForegroundVideo(pos, playing);
-  }
-});
-
 autoplaySimilarToggle.addEventListener('change', (e) => {
   localStorage.setItem('cleantube_autoplay_similar', e.target.checked ? 'true' : 'false');
-});
-
-audioOnlyToggle.addEventListener('change', (e) => {
-  localStorage.setItem('cleantube_audio_only', e.target.checked ? 'true' : 'false');
-  if (!currentStream) return;
-
-  if (e.target.checked) {
-    activateBackgroundAudio(videoPlayer.currentTime, !videoPlayer.paused);
-  } else {
-    activateForegroundVideo(bgAudioPlayer.currentTime, !bgAudioPlayer.paused);
-  }
 });
 
 repeatToggle.addEventListener('change', (e) => {
@@ -531,59 +511,30 @@ function configureMediaSession(streamData) {
       : []
   });
 
-  navigator.mediaSession.setActionHandler('play', async () => {
-    const player = getActiveMediaElement();
-    await player.play();
-    navigator.mediaSession.playbackState = 'playing';
+  navigator.mediaSession.setActionHandler('play', () => {
+    if (activeEngine === 'embed' && ytPlayer) {
+      ytPlayer.playVideo();
+    } else {
+      videoPlayer.play();
+    }
   });
 
   navigator.mediaSession.setActionHandler('pause', () => {
-    const player = getActiveMediaElement();
-    player.pause();
-    navigator.mediaSession.playbackState = 'paused';
-  });
-
-  navigator.mediaSession.setActionHandler('seekbackward', (details) => {
-    const player = getActiveMediaElement();
-    const offset = details.seekOffset || 10;
-    player.currentTime = Math.max(player.currentTime - offset, 0);
-    syncMediaSessionPosition(player);
-  });
-
-  navigator.mediaSession.setActionHandler('seekforward', (details) => {
-    const player = getActiveMediaElement();
-    const offset = details.seekOffset || 10;
-    const maxDuration = player.duration || Infinity;
-    player.currentTime = Math.min(player.currentTime + offset, maxDuration);
-    syncMediaSessionPosition(player);
-  });
-
-  navigator.mediaSession.setActionHandler('seekto', (details) => {
-    const player = getActiveMediaElement();
-    if (details.fastSeek && 'fastSeek' in player) {
-      player.fastSeek(details.seekTime);
+    if (activeEngine === 'embed' && ytPlayer) {
+      ytPlayer.pauseVideo();
     } else {
-      player.currentTime = details.seekTime;
+      videoPlayer.pause();
     }
-    syncMediaSessionPosition(player);
   });
 
   navigator.mediaSession.setActionHandler('previoustrack', () => {
-    const player = getActiveMediaElement();
-    if (player.currentTime > 5) {
-      player.currentTime = 0;
-      return;
-    }
     if (recentlyPlayedIds.length > 1) {
-      // Pop current song and play the previously played song
       recentlyPlayedIds.pop();
       const previousId = recentlyPlayedIds.pop();
       if (previousId) {
         loadAndPlayStream(previousId);
-        return;
       }
     }
-    player.currentTime = 0;
   });
 
   navigator.mediaSession.setActionHandler('nexttrack', () => {
@@ -591,58 +542,7 @@ function configureMediaSession(streamData) {
   });
 }
 
-function syncMediaSessionPosition(player) {
-  if (
-    'mediaSession' in navigator &&
-    typeof navigator.mediaSession.setPositionState === 'function' &&
-    player.duration &&
-    !isNaN(player.duration) &&
-    isFinite(player.duration)
-  ) {
-    try {
-      navigator.mediaSession.setPositionState({
-        duration: player.duration,
-        playbackRate: player.playbackRate || 1,
-        position: Math.min(Math.max(player.currentTime, 0), player.duration)
-      });
-    } catch (_) {}
-  }
-}
-
-[videoPlayer, bgAudioPlayer].forEach((player) => {
-  player.addEventListener('timeupdate', () => {
-    if (player === getActiveMediaElement()) {
-      syncMediaSessionPosition(player);
-    }
-  });
-
-  player.addEventListener('play', () => {
-    if (player === getActiveMediaElement() && 'mediaSession' in navigator) {
-      navigator.mediaSession.playbackState = 'playing';
-    }
-  });
-
-  player.addEventListener('pause', () => {
-    if (player === getActiveMediaElement() && 'mediaSession' in navigator) {
-      navigator.mediaSession.playbackState = 'paused';
-    }
-  });
-
-  player.addEventListener('ended', () => {
-    if (player !== getActiveMediaElement()) return;
-
-    // 1. If "Repeat Song" is checked, loop the current song
-    if (repeatToggle.checked && currentStream) {
-      player.currentTime = 0;
-      player.play();
-      recordTrackPlay(currentStream);
-      return;
-    }
-
-    // 2. Otherwise play a similar/recommended video (or next in queue if Autoplay Similar is unchecked)
-    playNextTrackOrSimilar();
-  });
-});
+videoPlayer.addEventListener('ended', handleTrackEnded);
 
 searchForm.addEventListener('submit', (e) => {
   e.preventDefault();
@@ -656,5 +556,4 @@ searchForm.addEventListener('submit', (e) => {
   }
 });
 
-// Load user's Most Played music on startup
 fetchLibrary();

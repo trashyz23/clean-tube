@@ -23,84 +23,52 @@ if (!fs.existsSync(LIBRARY_FILE)) {
   fs.writeFileSync(LIBRARY_FILE, JSON.stringify({ tracks: {} }, null, 2), 'utf8');
 }
 
-// If YTDLP_COOKIES environment variable is set in Render dashboard, write it to data/cookies.txt on startup
-if (process.env.YTDLP_COOKIES && process.env.YTDLP_COOKIES.trim().length > 0) {
-  fs.writeFileSync(COOKIES_FILE, process.env.YTDLP_COOKIES.trim() + '\n', 'utf8');
-  console.log('[Startup] Loaded cookies.txt from YTDLP_COOKIES environment variable.');
-}
-
 app.use(cors());
 app.use(compression());
 app.use(express.json({ limit: '2mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 
-let PIPED_INSTANCES = [
+const PIPED_INSTANCES = [
   'https://api.piped.private.coffee',
   'https://pipedapi.kavin.rocks',
   'https://pipedapi.leptons.xyz',
-  'https://pipedapi.nosebs.ru',
-  'https://pipedapi.drgns.space'
+  'https://pipedapi.nosebs.ru'
 ];
 
-let INVIDIOUS_INSTANCES = [
+const INVIDIOUS_INSTANCES = [
   'https://inv.nadeko.net',
   'https://inv.tux.pizza',
   'https://invidious.nerdvpn.de',
-  'https://invidious.jing.rocks',
   'https://yewtu.be'
 ];
 
-let YTDLP_BIN = 'yt-dlp';
-let ytDlpReadyPromise = null;
-
-function ensureYtDlpBinary() {
-  if (ytDlpReadyPromise) return ytDlpReadyPromise;
-
-  ytDlpReadyPromise = (async () => {
-    const checkCmd = (bin) =>
-      new Promise((resolve) => {
-        execFile(bin, ['--version'], { timeout: 5000 }, (err) => resolve(!err));
-      });
-
-    if (await checkCmd('yt-dlp')) {
-      YTDLP_BIN = 'yt-dlp';
-      console.log('[Startup] Found system yt-dlp binary.');
-      return YTDLP_BIN;
-    }
-
-    const tmpBin = path.join(os.tmpdir(), os.platform() === 'win32' ? 'yt-dlp.exe' : 'yt-dlp');
-    if (fs.existsSync(tmpBin) && (await checkCmd(tmpBin))) {
-      YTDLP_BIN = tmpBin;
-      console.log(`[Startup] Using cached yt-dlp binary at ${tmpBin}`);
-      return YTDLP_BIN;
-    }
-
-    console.log('[Startup] Downloading standalone yt-dlp binary to /tmp...');
-    const downloadUrl =
-      os.platform() === 'win32'
-        ? 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe'
-        : os.platform() === 'darwin'
-        ? 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_macos'
-        : 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux';
-
-    try {
-      const res = await fetch(downloadUrl);
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const buffer = Buffer.from(await res.arrayBuffer());
-      fs.writeFileSync(tmpBin, buffer, { mode: 0o755 });
-      fs.chmodSync(tmpBin, 0o755);
-      YTDLP_BIN = tmpBin;
-      console.log(`[Startup] Successfully installed yt-dlp to ${tmpBin}`);
-    } catch (err) {
-      console.error('[Startup] Failed to auto-download yt-dlp:', err.message);
-    }
-    return YTDLP_BIN;
-  })();
-
-  return ytDlpReadyPromise;
+function readLibrary() {
+  try {
+    const raw = fs.readFileSync(LIBRARY_FILE, 'utf8');
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed.tracks === 'object' ? parsed : { tracks: {} };
+  } catch (_) {
+    return { tracks: {} };
+  }
 }
 
-async function fetchWithTimeout(url, options = {}, timeoutMs = 4500) {
+function writeLibrary(data) {
+  fs.writeFileSync(LIBRARY_FILE, JSON.stringify(data, null, 2), 'utf8');
+}
+
+function extractVideoId(input) {
+  if (!input || typeof input !== 'string') return null;
+  const trimmed = input.trim();
+
+  const urlRegex = /(?:youtube\.com\/(?:[^\/]+\/.+\/|(?:v|e(?:mbed)?|shorts)\/|.*[?&]v=)|youtu\.be\/)([^"&?\/\s]{11})/;
+  const match = trimmed.match(urlRegex);
+  if (match && match[1]) return match[1];
+
+  if (/^[a-zA-Z0-9_-]{11}$/.test(trimmed)) return trimmed;
+  return null;
+}
+
+async function fetchWithTimeout(url, options = {}, timeoutMs = 2800) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
@@ -122,455 +90,179 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 4500) {
   }
 }
 
-async function refreshPublicInstances() {
-  try {
-    const res = await fetchWithTimeout('https://piped-instances.kavin.rocks/', {}, 5000);
-    if (res.ok) {
-      const list = await res.json();
-      const discovered = list
-        .filter((i) => i.api_url && i.up_to_date !== false)
-        .map((i) => i.api_url.replace(/\/$/, ''));
-      if (discovered.length > 0) {
-        PIPED_INSTANCES = [...new Set([...discovered.slice(0, 8), ...PIPED_INSTANCES])];
-      }
-    }
-  } catch (_) {}
-
-  try {
-    const res = await fetchWithTimeout('https://api.invidious.io/instances.json', {}, 5000);
-    if (res.ok) {
-      const list = await res.json();
-      const discovered = list
-        .filter(
-          (entry) =>
-            Array.isArray(entry) &&
-            entry[1] &&
-            entry[1].type === 'https' &&
-            entry[1].api === true &&
-            entry[1].uri
-        )
-        .map((entry) => entry[1].uri.replace(/\/$/, ''));
-      if (discovered.length > 0) {
-        INVIDIOUS_INSTANCES = [...new Set([...discovered.slice(0, 8), ...INVIDIOUS_INSTANCES])];
-      }
-    }
-  } catch (_) {}
-}
-
-ensureYtDlpBinary();
-refreshPublicInstances();
-
-function readLibrary() {
-  try {
-    const raw = fs.readFileSync(LIBRARY_FILE, 'utf8');
-    const parsed = JSON.parse(raw);
-    return parsed && typeof parsed.tracks === 'object' ? parsed : { tracks: {} };
-  } catch (_) {
-    return { tracks: {} };
-  }
-}
-
-function writeLibrary(data) {
-  fs.writeFileSync(LIBRARY_FILE, JSON.stringify(data, null, 2), 'utf8');
-}
-
-function hasValidCookiesFile() {
-  try {
-    return fs.existsSync(COOKIES_FILE) && fs.statSync(COOKIES_FILE).size > 20;
-  } catch (_) {
-    return false;
-  }
-}
-
-function extractVideoId(input) {
-  if (!input || typeof input !== 'string') return null;
-  const trimmed = input.trim();
-
-  const urlRegex = /(?:youtube\.com\/(?:[^\/]+\/.+\/|(?:v|e(?:mbed)?|shorts)\/|.*[?&]v=)|youtu\.be\/)([^"&?\/\s]{11})/;
-  const match = trimmed.match(urlRegex);
-  if (match && match[1]) return match[1];
-
-  if (/^[a-zA-Z0-9_-]{11}$/.test(trimmed)) return trimmed;
-  return null;
+/**
+ * Parses duration strings like "3:45" or "1:02:10" into seconds
+ */
+function parseDurationText(text) {
+  if (!text || typeof text !== 'string') return 0;
+  const parts = text.split(':').map((n) => parseInt(n, 10));
+  if (parts.some(isNaN)) return 0;
+  if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
+  if (parts.length === 2) return parts[0] * 60 + parts[1];
+  return parts[0] || 0;
 }
 
 /**
- * Builds yt-dlp arguments:
- * - Uses Node.js (--js-runtimes node) to solve YouTube's JS/n-challenges.
- * - Uses cookie-compatible clients (web_safari,mweb,web) when cookies.txt is present
- *   (because ios/android_vr ignore cookies!).
+ * Direct YouTube InnerTube Search (Works 100% on Render/AWS Datacenter IPs in ~250ms, no cookies needed)
  */
-function buildYtDlpArgs(extraArgs) {
-  const cookiesPresent = hasValidCookiesFile();
-  const clientList = cookiesPresent
-    ? 'youtube:player_client=web_safari,mweb,web'
-    : 'youtube:player_client=web_safari,tv_simply,mweb,ios';
-
-  const baseArgs = [
-    '--no-warnings',
-    '--geo-bypass',
-    '--js-runtimes',
-    'node',
-    '--extractor-args',
-    clientList
-  ];
-
-  if (cookiesPresent) {
-    baseArgs.push('--cookies', COOKIES_FILE);
-  }
-
-  return [...baseArgs, ...extraArgs];
-}
-
-function normalizePipedItems(items) {
-  if (!Array.isArray(items)) return [];
-  return items
-    .filter((item) => (item.type === 'stream' || !item.type) && item.url)
-    .map((item) => {
-      const idMatch = item.url.match(/v=([^&]+)/);
-      const videoId = idMatch ? idMatch[1] : extractVideoId(item.url);
-      return {
-        id: videoId,
-        title: item.title || 'Untitled Track',
-        uploader: item.uploaderName || item.uploader || 'Unknown Artist',
-        duration: typeof item.duration === 'number' ? item.duration : 0,
-        thumbnailUrl: item.thumbnail || `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
-        views: item.views || 0
-      };
-    })
-    .filter((item) => Boolean(item.id) && item.duration > 0);
-}
-
-async function searchWithPipedOrInvidious(query) {
-  for (const instance of PIPED_INSTANCES) {
-    try {
-      const url = `${instance}/search?q=${encodeURIComponent(query)}&filter=videos`;
-      const response = await fetchWithTimeout(url, {}, 3800);
-      if (!response.ok) continue;
-      const data = await response.json();
-      const items = normalizePipedItems(data.items);
-      if (items.length > 0) {
-        return { results: items, source: `piped (${instance})` };
-      }
-    } catch (_) {}
-  }
-
-  for (const instance of INVIDIOUS_INSTANCES) {
-    try {
-      const url = `${instance}/api/v1/search?q=${encodeURIComponent(query)}&type=video`;
-      const response = await fetchWithTimeout(url, {}, 3800);
-      if (!response.ok) continue;
-      const data = await response.json();
-      if (!Array.isArray(data)) continue;
-
-      const items = data
-        .filter((item) => item.videoId)
-        .map((item) => ({
-          id: item.videoId,
-          title: item.title || 'Untitled Track',
-          uploader: item.author || 'Unknown Artist',
-          duration: item.lengthSeconds || 0,
-          thumbnailUrl: `https://i.ytimg.com/vi/${item.videoId}/hqdefault.jpg`,
-          views: item.viewCount || 0
-        }));
-
-      if (items.length > 0) {
-        return { results: items, source: `invidious (${instance})` };
-      }
-    } catch (_) {}
-  }
-
-  throw new Error('All Piped and Invidious search instances failed');
-}
-
-async function searchWithYtDlp(query, maxResults = 12) {
-  await ensureYtDlpBinary();
-  return new Promise((resolve, reject) => {
-    const searchArg = `ytsearch${maxResults}:${query}`;
-    execFile(
-      YTDLP_BIN,
-      buildYtDlpArgs(['--flat-playlist', '--dump-json', searchArg]),
-      { maxBuffer: 1024 * 1024 * 10, timeout: 20000 },
-      (error, stdout) => {
-        if (error) return reject(error);
-        try {
-          const lines = stdout
-            .trim()
-            .split('\n')
-            .filter((line) => line.trim().length > 0);
-
-          const results = lines.map((line) => {
-            const item = JSON.parse(line);
-            return {
-              id: item.id,
-              title: item.title || 'Untitled Track',
-              uploader: item.uploader || item.channel || 'Unknown Artist',
-              duration: item.duration || 0,
-              thumbnailUrl: `https://i.ytimg.com/vi/${item.id}/hqdefault.jpg`,
-              views: item.view_count || 0
-            };
-          });
-
-          resolve({ results, source: 'yt-dlp' });
-        } catch (parseError) {
-          reject(parseError);
-        }
-      }
-    );
-  });
-}
-
-async function resolveStreamWithPiped(videoId) {
-  for (const instance of PIPED_INSTANCES) {
-    try {
-      const response = await fetchWithTimeout(
-        `${instance}/streams/${encodeURIComponent(videoId)}`,
-        {},
-        4000
-      );
-      if (!response.ok) continue;
-
-      const data = await response.json();
-      if (data.error) continue;
-
-      const muxedStreams = (data.videoStreams || []).filter((s) => s.videoOnly === false && s.url);
-      muxedStreams.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
-
-      const audioStreams = (data.audioStreams || []).filter((s) => s.url);
-      audioStreams.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
-
-      const videoUrl = muxedStreams[0]?.url || data.hls || null;
-      const audioUrl = audioStreams[0]?.url || muxedStreams[0]?.url || data.hls || null;
-
-      if (!videoUrl && !audioUrl) continue;
-
-      const related = normalizePipedItems(data.relatedStreams).filter((item) => item.id !== videoId);
-
-      return {
-        id: videoId,
-        title: data.title || 'Untitled Track',
-        uploader: data.uploader || 'Unknown Artist',
-        duration: data.duration || 0,
-        thumbnailUrl: data.thumbnailUrl || `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
-        videoUrl,
-        audioUrl,
-        hlsUrl: data.hls || null,
-        related,
-        source: `piped (${instance})`
-      };
-    } catch (_) {}
-  }
-  throw new Error('All Piped stream instances failed');
-}
-
-async function resolveStreamWithInvidious(videoId) {
-  for (const instance of INVIDIOUS_INSTANCES) {
-    try {
-      const response = await fetchWithTimeout(
-        `${instance}/api/v1/videos/${encodeURIComponent(videoId)}`,
-        {},
-        4000
-      );
-      if (!response.ok) continue;
-
-      const data = await response.json();
-      if (!data.formatStreams && !data.adaptiveFormats) continue;
-
-      const toLocalProxyUrl = (rawUrl) => {
-        if (!rawUrl) return null;
-        try {
-          const parsed = new URL(rawUrl);
-          if (parsed.hostname.includes('googlevideo.com')) {
-            return `${instance}/latest_version?id=${encodeURIComponent(videoId)}&itag=${parsed.searchParams.get('itag')}&local=true`;
+async function searchYouTubeInnerTube(query) {
+  const response = await fetchWithTimeout(
+    'https://www.youtube.com/youtubei/v1/search?prettyPrint=false',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        query,
+        context: {
+          client: {
+            clientName: 'WEB',
+            clientVersion: '2.20250101.00.00',
+            hl: 'en',
+            gl: 'US'
           }
-          return rawUrl;
-        } catch (_) {
-          return rawUrl;
         }
-      };
+      })
+    },
+    4500
+  );
 
-      const muxed = (data.formatStreams || []).filter((f) => f.url);
-      const audio = (data.adaptiveFormats || []).filter(
-        (f) => f.type && f.type.startsWith('audio/') && f.url
-      );
-      audio.sort((a, b) => (parseInt(b.bitrate, 10) || 0) - (parseInt(a.bitrate, 10) || 0));
+  if (!response.ok) throw new Error(`InnerTube search HTTP ${response.status}`);
+  const data = await response.json();
 
-      const rawVideo = muxed[muxed.length - 1]?.url || null;
-      const rawAudio = audio[0]?.url || rawVideo;
+  const results = [];
+  const sections =
+    data?.contents?.twoColumnSearchResultsRenderer?.primaryContents?.sectionListRenderer?.contents || [];
 
-      if (!rawVideo && !rawAudio) continue;
+  for (const section of sections) {
+    const items = section?.itemSectionRenderer?.contents || [];
+    for (const item of items) {
+      const v = item.videoRenderer;
+      if (!v || !v.videoId) continue;
 
-      const related = (data.recommendedVideos || [])
-        .filter((v) => v.videoId && v.videoId !== videoId)
-        .map((v) => ({
-          id: v.videoId,
-          title: v.title || 'Recommended Track',
-          uploader: v.author || 'Unknown Artist',
-          duration: v.lengthSeconds || 0,
-          thumbnailUrl: `https://i.ytimg.com/vi/${v.videoId}/hqdefault.jpg`
-        }));
+      const title =
+        v.title?.runs?.map((r) => r.text).join('') ||
+        v.title?.simpleText ||
+        'Untitled Track';
+      const uploader =
+        v.ownerText?.runs?.[0]?.text ||
+        v.longBylineText?.runs?.[0]?.text ||
+        'Unknown Artist';
+      const durationText = v.lengthText?.simpleText || '';
+      const duration = parseDurationText(durationText);
 
-      return {
-        id: videoId,
-        title: data.title || 'Untitled Track',
-        uploader: data.author || 'Unknown Artist',
-        duration: data.lengthSeconds || 0,
-        thumbnailUrl: `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
-        videoUrl: toLocalProxyUrl(rawVideo || rawAudio),
-        audioUrl: toLocalProxyUrl(rawAudio || rawVideo),
-        hlsUrl: data.hlsUrl || null,
-        related,
-        source: `invidious (${instance})`
-      };
-    } catch (_) {}
-  }
-  throw new Error('All Invidious instances failed');
-}
-
-async function resolveStreamWithYtDlp(queryOrId) {
-  await ensureYtDlpBinary();
-  return new Promise((resolve, reject) => {
-    const cleanId = extractVideoId(queryOrId);
-    const target = cleanId ? `https://www.youtube.com/watch?v=${cleanId}` : `ytsearch1:${queryOrId}`;
-
-    execFile(
-      YTDLP_BIN,
-      buildYtDlpArgs(['--dump-json', '--no-playlist', target]),
-      { maxBuffer: 1024 * 1024 * 15, timeout: 25000 },
-      (error, stdout, stderr) => {
-        if (error) {
-          return reject(new Error(stderr || error.message));
-        }
-        try {
-          const lines = stdout.trim().split('\n');
-          const data = JSON.parse(lines[0]);
-          const formats = data.formats || [];
-
-          const muxedFormats = formats.filter(
-            (f) =>
-              f.vcodec &&
-              f.vcodec !== 'none' &&
-              f.acodec &&
-              f.acodec !== 'none' &&
-              f.url &&
-              (f.ext === 'mp4' || f.ext === 'webm')
-          );
-          muxedFormats.sort((a, b) => (a.height || 0) - (b.height || 0));
-          const bestMuxed = muxedFormats[muxedFormats.length - 1];
-
-          const audioFormats = formats.filter(
-            (f) =>
-              (!f.vcodec || f.vcodec === 'none') &&
-              f.acodec &&
-              f.acodec !== 'none' &&
-              f.url &&
-              (f.ext === 'm4a' || f.ext === 'webm' || f.ext === 'mp4')
-          );
-          audioFormats.sort((a, b) => (a.abr || a.tbr || 0) - (b.abr || b.tbr || 0));
-          const bestAudio = audioFormats[audioFormats.length - 1];
-
-          const rawVideoUrl = bestMuxed ? bestMuxed.url : data.url || null;
-          const rawAudioUrl = bestAudio ? bestAudio.url : rawVideoUrl;
-
-          if (!rawVideoUrl && !rawAudioUrl) {
-            return reject(new Error('No playable media formats found by yt-dlp'));
-          }
-
-          const wrapProxy = (u) => (u ? `/api/proxy?url=${encodeURIComponent(u)}` : null);
-
-          resolve({
-            id: data.id || cleanId,
-            title: data.title || 'Untitled Track',
-            uploader: data.uploader || data.channel || 'Unknown Artist',
-            duration: data.duration || 0,
-            thumbnailUrl: data.thumbnail || `https://i.ytimg.com/vi/${data.id}/hqdefault.jpg`,
-            videoUrl: wrapProxy(rawVideoUrl),
-            audioUrl: wrapProxy(rawAudioUrl),
-            hlsUrl: null,
-            related: [],
-            source: hasValidCookiesFile() ? 'yt-dlp (authenticated)' : 'yt-dlp (proxied)'
-          });
-        } catch (parseErr) {
-          reject(parseErr);
-        }
-      }
-    );
-  });
-}
-
-// ============================================================================
-// Cookie Management Endpoints (For Cloud / Render Datacenter IP Auth)
-// ============================================================================
-
-app.get('/api/cookies/status', (_req, res) => {
-  res.json({ hasCookies: hasValidCookiesFile() });
-});
-
-app.post('/api/cookies', (req, res) => {
-  const { cookiesText } = req.body || {};
-  if (!cookiesText || typeof cookiesText !== 'string' || !cookiesText.includes('youtube.com')) {
-    return res.status(400).json({
-      error: 'Invalid cookies.txt content. Make sure it is in Netscape HTTP Cookie File format and includes youtube.com.'
-    });
-  }
-
-  fs.writeFileSync(COOKIES_FILE, cookiesText.trim() + '\n', 'utf8');
-  res.json({ success: true, hasCookies: true });
-});
-
-app.delete('/api/cookies', (_req, res) => {
-  if (fs.existsSync(COOKIES_FILE)) {
-    fs.unlinkSync(COOKIES_FILE);
-  }
-  res.json({ success: true, hasCookies: false });
-});
-
-// ============================================================================
-// Byte-Range Media Stream Proxy (/api/proxy?url=...)
-// ============================================================================
-
-app.get('/api/proxy', (req, res) => {
-  const targetUrl = req.query.url;
-  if (!targetUrl) return res.status(400).send('Missing url parameter');
-
-  try {
-    const parsed = new URL(targetUrl);
-    if (!parsed.hostname.endsWith('googlevideo.com') && !parsed.hostname.endsWith('youtube.com')) {
-      return res.status(403).send('Proxy only permits media stream domains');
-    }
-
-    const headers = {
-      'User-Agent':
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
-    };
-    if (req.headers.range) {
-      headers.Range = req.headers.range;
-    }
-
-    const proxyReq = https.get(targetUrl, { headers }, (proxyRes) => {
-      res.status(proxyRes.statusCode || 200);
-      const forwardHeaders = [
-        'content-type',
-        'content-length',
-        'content-range',
-        'accept-ranges',
-        'cache-control'
-      ];
-      forwardHeaders.forEach((h) => {
-        if (proxyRes.headers[h]) res.setHeader(h, proxyRes.headers[h]);
+      results.push({
+        id: v.videoId,
+        title,
+        uploader,
+        duration,
+        thumbnailUrl: `https://i.ytimg.com/vi/${v.videoId}/hqdefault.jpg`
       });
-      proxyRes.pipe(res);
-    });
 
-    proxyReq.on('error', (err) => {
-      if (!res.headersSent) res.status(502).send(err.message);
-    });
-
-    req.on('close', () => proxyReq.destroy());
-  } catch (_) {
-    res.status(400).send('Invalid stream URL');
+      if (results.length >= 15) break;
+    }
+    if (results.length >= 15) break;
   }
-});
+
+  if (results.length === 0) throw new Error('No InnerTube search results');
+  return { results, source: 'youtube-innertube' };
+}
+
+/**
+ * Fetches Video Title & Artist in ~150ms via YouTube's public oEmbed API (Never blocked on Render)
+ */
+async function fetchVideoMetadataFast(videoId) {
+  try {
+    const url = `https://www.youtube.com/oembed?url=${encodeURIComponent(
+      `https://www.youtube.com/watch?v=${videoId}`
+    )}&format=json`;
+    const res = await fetchWithTimeout(url, {}, 3000);
+    if (res.ok) {
+      const data = await res.json();
+      return {
+        id: videoId,
+        title: data.title || 'Untitled Track',
+        uploader: data.author_name || 'Unknown Artist',
+        duration: 0,
+        thumbnailUrl: `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`
+      };
+    }
+  } catch (_) {}
+
+  return {
+    id: videoId,
+    title: 'YouTube Track',
+    uploader: 'YouTube Music',
+    duration: 0,
+    thumbnailUrl: `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`
+  };
+}
+
+/**
+ * Fast Parallel Direct Stream Resolver (Runs all Piped & Invidious instances in parallel with 2.5s cap)
+ */
+async function resolveDirectStreamFast(videoId) {
+  const pipedTasks = PIPED_INSTANCES.map(async (instance) => {
+    const res = await fetchWithTimeout(`${instance}/streams/${encodeURIComponent(videoId)}`, {}, 2500);
+    if (!res.ok) throw new Error('Piped non-200');
+    const data = await res.json();
+
+    const muxed = (data.videoStreams || []).filter((s) => !s.videoOnly && s.url);
+    const audio = (data.audioStreams || []).filter((s) => s.url);
+    audio.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
+
+    const videoUrl = muxed[0]?.url || data.hls || null;
+    const audioUrl = audio[0]?.url || videoUrl;
+    if (!videoUrl && !audioUrl) throw new Error('No Piped URLs');
+
+    return {
+      id: videoId,
+      title: data.title || 'Untitled Track',
+      uploader: data.uploader || 'Unknown Artist',
+      duration: data.duration || 0,
+      thumbnailUrl: data.thumbnailUrl || `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
+      videoUrl,
+      audioUrl,
+      playbackMode: 'direct',
+      source: `piped (${instance})`
+    };
+  });
+
+  const invidiousTasks = INVIDIOUS_INSTANCES.map(async (instance) => {
+    const res = await fetchWithTimeout(
+      `${instance}/api/v1/videos/${encodeURIComponent(videoId)}`,
+      {},
+      2500
+    );
+    if (!res.ok) throw new Error('Invidious non-200');
+    const data = await res.json();
+
+    const muxed = (data.formatStreams || []).filter((f) => f.url);
+    const audio = (data.adaptiveFormats || []).filter(
+      (f) => f.type && f.type.startsWith('audio/') && f.url
+    );
+    if (muxed.length === 0 && audio.length === 0) throw new Error('No Invidious URLs');
+
+    const toProxied = (rawUrl) => {
+      if (!rawUrl) return null;
+      const parsed = new URL(rawUrl);
+      return `${instance}/latest_version?id=${encodeURIComponent(videoId)}&itag=${parsed.searchParams.get('itag')}&local=true`;
+    };
+
+    return {
+      id: videoId,
+      title: data.title || 'Untitled Track',
+      uploader: data.author || 'Unknown Artist',
+      duration: data.lengthSeconds || 0,
+      thumbnailUrl: `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
+      videoUrl: toProxied(muxed[0]?.url || audio[0]?.url),
+      audioUrl: toProxied(audio[0]?.url || muxed[0]?.url),
+      playbackMode: 'direct',
+      source: `invidious (${instance})`
+    };
+  });
+
+  return Promise.any([...pipedTasks, ...invidiousTasks]);
+}
 
 // ============================================================================
 // Music Library & Most Watched API Endpoints
@@ -653,64 +345,7 @@ app.delete('/api/library/:id', (req, res) => {
 });
 
 // ============================================================================
-// Related / Similar Videos Endpoint
-// ============================================================================
-
-app.get('/api/related/:id', async (req, res) => {
-  const videoId = extractVideoId(req.params.id);
-  const fallbackQuery = (req.query.q || '').trim();
-
-  if (!videoId) return res.status(400).json({ error: 'Invalid video ID' });
-
-  for (const instance of PIPED_INSTANCES) {
-    try {
-      const response = await fetchWithTimeout(
-        `${instance}/streams/${encodeURIComponent(videoId)}`,
-        {},
-        3800
-      );
-      if (!response.ok) continue;
-      const data = await response.json();
-      const related = normalizePipedItems(data.relatedStreams).filter((item) => item.id !== videoId);
-      if (related.length > 0) return res.json({ related, source: `piped (${instance})` });
-    } catch (_) {}
-  }
-
-  for (const instance of INVIDIOUS_INSTANCES) {
-    try {
-      const response = await fetchWithTimeout(
-        `${instance}/api/v1/videos/${encodeURIComponent(videoId)}`,
-        {},
-        3800
-      );
-      if (!response.ok) continue;
-      const data = await response.json();
-      const related = (data.recommendedVideos || [])
-        .filter((v) => v.videoId && v.videoId !== videoId)
-        .map((v) => ({
-          id: v.videoId,
-          title: v.title || 'Recommended Track',
-          uploader: v.author || 'Unknown Artist',
-          duration: v.lengthSeconds || 0,
-          thumbnailUrl: `https://i.ytimg.com/vi/${v.videoId}/hqdefault.jpg`
-        }));
-      if (related.length > 0) return res.json({ related, source: `invidious (${instance})` });
-    } catch (_) {}
-  }
-
-  if (fallbackQuery) {
-    try {
-      const searchFallback = await searchWithPipedOrInvidious(fallbackQuery);
-      const filtered = (searchFallback.results || []).filter((item) => item.id !== videoId);
-      return res.json({ related: filtered, source: searchFallback.source });
-    } catch (_) {}
-  }
-
-  res.json({ related: [], source: 'none' });
-});
-
-// ============================================================================
-// Search & Stream Resolution Endpoints
+// Search, Related Songs & Stream Endpoints
 // ============================================================================
 
 app.get('/api/search', async (req, res) => {
@@ -718,17 +353,31 @@ app.get('/api/search', async (req, res) => {
   if (!query) return res.status(400).json({ error: 'Missing search query parameter "q"' });
 
   try {
-    const apiResults = await searchWithPipedOrInvidious(query);
-    return res.json(apiResults);
-  } catch (_) {
-    try {
-      const ytdlpResults = await searchWithYtDlp(query);
-      return res.json(ytdlpResults);
-    } catch (ytdlpErr) {
-      return res.status(502).json({
-        error: `Search failed: ${ytdlpErr.message}`
-      });
+    const innerTubeResults = await searchYouTubeInnerTube(query);
+    return res.json(innerTubeResults);
+  } catch (err) {
+    return res.status(502).json({ error: `Search failed: ${err.message}` });
+  }
+});
+
+app.get('/api/related/:id', async (req, res) => {
+  const videoId = extractVideoId(req.params.id);
+  const fallbackQuery = (req.query.q || '').trim();
+
+  if (!videoId) return res.status(400).json({ error: 'Invalid video ID' });
+
+  // Use InnerTube search to find similar/mix songs by the same artist/track
+  try {
+    let searchQuery = fallbackQuery;
+    if (!searchQuery) {
+      const meta = await fetchVideoMetadataFast(videoId);
+      searchQuery = `${meta.uploader} ${meta.title}`;
     }
+    const searchData = await searchYouTubeInnerTube(`${searchQuery} mix`);
+    const related = (searchData.results || []).filter((item) => item.id !== videoId);
+    return res.json({ related, source: 'youtube-mix' });
+  } catch (err) {
+    return res.json({ related: [], source: 'none' });
   }
 });
 
@@ -740,11 +389,15 @@ app.get('/api/stream/:query', async (req, res) => {
 
   if (!videoId) {
     try {
-      const searchData = await searchWithPipedOrInvidious(rawInput);
+      const searchData = await searchYouTubeInnerTube(rawInput);
       if (searchData.results && searchData.results.length > 0) {
         videoId = searchData.results[0].id;
       }
     } catch (_) {}
+  }
+
+  if (!videoId) {
+    return res.status(404).json({ error: 'Could not find a matching video ID' });
   }
 
   const attachLibraryMeta = (streamData) => {
@@ -754,37 +407,35 @@ app.get('/api/stream/:query', async (req, res) => {
     return streamData;
   };
 
-  if (videoId) {
-    try {
-      const pipedData = await resolveStreamWithPiped(videoId);
-      return res.json(attachLibraryMeta(pipedData));
-    } catch (_) {}
-
-    try {
-      const invData = await resolveStreamWithInvidious(videoId);
-      return res.json(attachLibraryMeta(invData));
-    } catch (_) {}
-  }
-
+  // 1. Try Fast Parallel Direct Stream Resolution (2.5s max wait)
   try {
-    const fallbackData = await resolveStreamWithYtDlp(videoId || rawInput);
-    return res.json(attachLibraryMeta(fallbackData));
-  } catch (ytdlpError) {
-    return res.status(502).json({
-      error: `Stream resolution failed (${ytdlpError.message.slice(0, 140)})`,
-      details: ytdlpError.message,
-      needsCookies: ytdlpError.message.includes('Sign in to confirm')
-    });
+    const directData = await resolveDirectStreamFast(videoId);
+    return res.json(attachLibraryMeta(directData));
+  } catch (_) {
+    // 2. Instant Cloud Fallback: Return metadata + embed mode so playback starts immediately on Render
+    const meta = await fetchVideoMetadataFast(videoId);
+    const relatedQuery = `${meta.uploader} ${meta.title}`;
+    let related = [];
+    try {
+      const relSearch = await searchYouTubeInnerTube(`${relatedQuery} song`);
+      related = (relSearch.results || []).filter((item) => item.id !== videoId);
+    } catch (_) {}
+
+    return res.json(
+      attachLibraryMeta({
+        ...meta,
+        videoUrl: null,
+        audioUrl: null,
+        related,
+        playbackMode: 'embed',
+        source: 'youtube-direct-player'
+      })
+    );
   }
 });
 
 app.get('/api/health', (_req, res) => {
-  res.json({
-    status: 'ok',
-    ytdlpBin: YTDLP_BIN,
-    hasCookies: hasValidCookiesFile(),
-    timestamp: new Date().toISOString()
-  });
+  res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
 // Express 4 & Express 5 compatible SPA catch-all
@@ -793,5 +444,5 @@ app.use((_req, res) => {
 });
 
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`CleanTube Cloud-Ready Server running at http://0.0.0.0:${PORT}`);
+  console.log(`CleanTube Hybrid Server running at http://0.0.0.0:${PORT}`);
 });
