@@ -443,25 +443,49 @@ app.get('/api/related/:id', async (req, res) => {
 // ============================================================================
 
 app.get('/api/search', async (req, res) => {
-  const query = (req.query.q || '').trim();
-  if (!query) {
-    return res.status(400).json({ error: 'Missing search query parameter "q"' });
-  }
+  const query = req.query.q;
+  if (!query) return res.status(400).json({ error: 'Query required' });
 
-  try {
-    const pipedResults = await searchWithPiped(query);
-    return res.json(pipedResults);
-  } catch (_) {
+  // Список доступных публичных API для поиска
+  const instances = [
+    'https://invidious.nerdvpn.de/api/v1',
+    'https://inv.tux.stream/api/v1',
+    'https://api.piped.privacydev.net',
+    'https://pipedapi.mha.fi'
+  ];
+
+  for (const baseUrl of instances) {
     try {
-      const ytdlpResults = await searchWithYtDlp(query);
-      return res.json(ytdlpResults);
-    } catch (ytdlpErr) {
-      return res.status(502).json({
-        error: 'Search failed across both Piped API and yt-dlp fallback.',
-        details: ytdlpErr.message
-      });
+      const isInvidious = baseUrl.includes('/api/v1');
+      const searchUrl = isInvidious
+        ? `${baseUrl}/search?q=${encodeURIComponent(query)}&type=video`
+        : `${baseUrl}/search?q=${encodeURIComponent(query)}&filter=videos`;
+
+      const response = await fetch(searchUrl, { signal: AbortSignal.timeout(5000) });
+      if (!response.ok) continue;
+
+      const data = await response.json();
+      const items = isInvidious ? data : (data.items || []);
+
+      if (Array.isArray(items) && items.length > 0) {
+        const results = items.map(item => ({
+          id: isInvidious ? item.videoId : (item.url ? item.url.replace('/watch?v=', '') : item.id),
+          title: item.title,
+          thumbnail: isInvidious ? (item.videoThumbnails?.[0]?.url || '') : item.thumbnail,
+          uploaderName: isInvidious ? item.author : item.uploaderName,
+          duration: isInvidious ? item.lengthSeconds : item.duration
+        })).filter(i => i.id);
+
+        if (results.length > 0) {
+          return res.json(results);
+        }
+      }
+    } catch (err) {
+      console.log(`Failed fetch from ${baseUrl}:`, err.message);
     }
   }
+
+  res.status(500).json({ error: 'Search failed across available API instances.' });
 });
 
 app.get('/api/stream/:query', async (req, res) => {
