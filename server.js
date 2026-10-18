@@ -30,74 +30,100 @@ app.use(express.static(path.join(__dirname, 'public')));
 
 // Fallback Piped & Invidious instances (also dynamically updated at runtime)
 let PIPED_INSTANCES = [
-  'https://pipedapi.kavin.rocks',
   'https://api.piped.private.coffee',
+  'https://pipedapi.kavin.rocks',
   'https://pipedapi.leptons.xyz',
   'https://pipedapi.nosebs.ru',
   'https://pipedapi.drgns.space'
 ];
 
 let INVIDIOUS_INSTANCES = [
+  'https://inv.nadeko.net',
   'https://inv.tux.pizza',
   'https://invidious.nerdvpn.de',
-  'https://inv.nadeko.net',
   'https://invidious.jing.rocks',
   'https://yewtu.be'
 ];
 
-// Path to yt-dlp binary (system PATH or auto-downloaded to /tmp/yt-dlp)
 let YTDLP_BIN = 'yt-dlp';
+let ytDlpReadyPromise = null;
 
 /**
- * Automatically downloads standalone yt-dlp binary to /tmp/yt-dlp
- * if the cloud deployment environment (e.g. Render/Railway Node buildpack) doesn't have it.
+ * Automatically downloads standalone yt-dlp_linux binary to /tmp/yt-dlp
+ * if Render's Node environment doesn't have yt-dlp pre-installed.
  */
-async function ensureYtDlpBinary() {
-  const checkCmd = (bin) =>
-    new Promise((resolve) => {
-      execFile(bin, ['--version'], { timeout: 5000 }, (err) => resolve(!err));
-    });
+function ensureYtDlpBinary() {
+  if (ytDlpReadyPromise) return ytDlpReadyPromise;
 
-  if (await checkCmd('yt-dlp')) {
-    YTDLP_BIN = 'yt-dlp';
-    console.log('[Startup] Found system yt-dlp binary.');
-    return;
-  }
+  ytDlpReadyPromise = (async () => {
+    const checkCmd = (bin) =>
+      new Promise((resolve) => {
+        execFile(bin, ['--version'], { timeout: 5000 }, (err) => resolve(!err));
+      });
 
-  const tmpBin = path.join(os.tmpdir(), os.platform() === 'win32' ? 'yt-dlp.exe' : 'yt-dlp');
-  if (fs.existsSync(tmpBin) && (await checkCmd(tmpBin))) {
-    YTDLP_BIN = tmpBin;
-    console.log(`[Startup] Using cached yt-dlp binary at ${tmpBin}`);
-    return;
-  }
+    if (await checkCmd('yt-dlp')) {
+      YTDLP_BIN = 'yt-dlp';
+      console.log('[Startup] Found system yt-dlp binary.');
+      return YTDLP_BIN;
+    }
 
-  console.log('[Startup] System yt-dlp not found. Downloading standalone binary to /tmp...');
-  const downloadUrl =
-    os.platform() === 'win32'
-      ? 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe'
-      : os.platform() === 'darwin'
-      ? 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_macos'
-      : 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux';
+    const tmpBin = path.join(os.tmpdir(), os.platform() === 'win32' ? 'yt-dlp.exe' : 'yt-dlp');
+    if (fs.existsSync(tmpBin) && (await checkCmd(tmpBin))) {
+      YTDLP_BIN = tmpBin;
+      console.log(`[Startup] Using cached yt-dlp binary at ${tmpBin}`);
+      return YTDLP_BIN;
+    }
 
+    console.log('[Startup] Downloading standalone yt-dlp binary to /tmp...');
+    const downloadUrl =
+      os.platform() === 'win32'
+        ? 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe'
+        : os.platform() === 'darwin'
+        ? 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_macos'
+        : 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux';
+
+    try {
+      const res = await fetch(downloadUrl);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const buffer = Buffer.from(await res.arrayBuffer());
+      fs.writeFileSync(tmpBin, buffer, { mode: 0o755 });
+      fs.chmodSync(tmpBin, 0o755);
+      YTDLP_BIN = tmpBin;
+      console.log(`[Startup] Successfully installed yt-dlp to ${tmpBin}`);
+    } catch (err) {
+      console.error('[Startup] Failed to auto-download yt-dlp:', err.message);
+    }
+    return YTDLP_BIN;
+  })();
+
+  return ytDlpReadyPromise;
+}
+
+async function fetchWithTimeout(url, options = {}, timeoutMs = 4500) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const res = await fetch(downloadUrl);
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const buffer = Buffer.from(await res.arrayBuffer());
-    fs.writeFileSync(tmpBin, buffer, { mode: 0o755 });
-    fs.chmodSync(tmpBin, 0o755);
-    YTDLP_BIN = tmpBin;
-    console.log(`[Startup] Successfully installed yt-dlp to ${tmpBin}`);
-  } catch (err) {
-    console.error('[Startup] Failed to auto-download yt-dlp:', err.message);
+    const response = await fetch(url, {
+      ...options,
+      signal: controller.signal,
+      headers: {
+        'User-Agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        Accept: 'application/json',
+        ...(options.headers || {})
+      }
+    });
+    clearTimeout(timer);
+    return response;
+  } catch (error) {
+    clearTimeout(timer);
+    throw error;
   }
 }
 
-/**
- * Dynamically refreshes healthy Piped & Invidious instances on startup
- */
 async function refreshPublicInstances() {
   try {
-    const res = await fetchWithTimeout('https://piped-instances.kavin.rocks/', 5000);
+    const res = await fetchWithTimeout('https://piped-instances.kavin.rocks/', {}, 5000);
     if (res.ok) {
       const list = await res.json();
       const discovered = list
@@ -106,6 +132,27 @@ async function refreshPublicInstances() {
       if (discovered.length > 0) {
         PIPED_INSTANCES = [...new Set([...discovered.slice(0, 8), ...PIPED_INSTANCES])];
         console.log(`[Startup] Loaded ${PIPED_INSTANCES.length} Piped instances.`);
+      }
+    }
+  } catch (_) {}
+
+  try {
+    const res = await fetchWithTimeout('https://api.invidious.io/instances.json', {}, 5000);
+    if (res.ok) {
+      const list = await res.json();
+      const discovered = list
+        .filter(
+          (entry) =>
+            Array.isArray(entry) &&
+            entry[1] &&
+            entry[1].type === 'https' &&
+            entry[1].api === true &&
+            entry[1].uri
+        )
+        .map((entry) => entry[1].uri.replace(/\/$/, ''));
+      if (discovered.length > 0) {
+        INVIDIOUS_INSTANCES = [...new Set([...discovered.slice(0, 8), ...INVIDIOUS_INSTANCES])];
+        console.log(`[Startup] Loaded ${INVIDIOUS_INSTANCES.length} Invidious instances.`);
       }
     }
   } catch (_) {}
@@ -140,32 +187,12 @@ function extractVideoId(input) {
   return null;
 }
 
-async function fetchWithTimeout(url, timeoutMs = 4500) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const response = await fetch(url, {
-      signal: controller.signal,
-      headers: {
-        'User-Agent':
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-        Accept: 'application/json'
-      }
-    });
-    clearTimeout(timer);
-    return response;
-  } catch (error) {
-    clearTimeout(timer);
-    throw error;
-  }
-}
-
 function buildYtDlpArgs(extraArgs) {
   const baseArgs = [
     '--no-warnings',
     '--geo-bypass',
     '--extractor-args',
-    'youtube:player_client=ios,mweb,tv_embedded,web'
+    'youtube:player_client=android_vr,ios,mweb,tv_embedded'
   ];
   if (fs.existsSync(COOKIES_FILE)) {
     baseArgs.push('--cookies', COOKIES_FILE);
@@ -193,14 +220,13 @@ function normalizePipedItems(items) {
 }
 
 /**
- * Search via Piped -> Invidious -> yt-dlp
+ * Search via Piped -> Invidious -> YouTube InnerTube -> yt-dlp
  */
 async function searchWithPipedOrInvidious(query) {
-  // 1. Try Piped
   for (const instance of PIPED_INSTANCES) {
     try {
       const url = `${instance}/search?q=${encodeURIComponent(query)}&filter=videos`;
-      const response = await fetchWithTimeout(url, 4000);
+      const response = await fetchWithTimeout(url, {}, 3800);
       if (!response.ok) continue;
       const data = await response.json();
       const items = normalizePipedItems(data.items);
@@ -210,11 +236,10 @@ async function searchWithPipedOrInvidious(query) {
     } catch (_) {}
   }
 
-  // 2. Try Invidious API
   for (const instance of INVIDIOUS_INSTANCES) {
     try {
       const url = `${instance}/api/v1/search?q=${encodeURIComponent(query)}&type=video`;
-      const response = await fetchWithTimeout(url, 4000);
+      const response = await fetchWithTimeout(url, {}, 3800);
       if (!response.ok) continue;
       const data = await response.json();
       if (!Array.isArray(data)) continue;
@@ -239,7 +264,8 @@ async function searchWithPipedOrInvidious(query) {
   throw new Error('All Piped and Invidious search instances failed');
 }
 
-function searchWithYtDlp(query, maxResults = 12) {
+async function searchWithYtDlp(query, maxResults = 12) {
+  await ensureYtDlpBinary();
   return new Promise((resolve, reject) => {
     const searchArg = `ytsearch${maxResults}:${query}`;
     execFile(
@@ -281,7 +307,11 @@ function searchWithYtDlp(query, maxResults = 12) {
 async function resolveStreamWithPiped(videoId) {
   for (const instance of PIPED_INSTANCES) {
     try {
-      const response = await fetchWithTimeout(`${instance}/streams/${encodeURIComponent(videoId)}`, 4200);
+      const response = await fetchWithTimeout(
+        `${instance}/streams/${encodeURIComponent(videoId)}`,
+        {},
+        4000
+      );
       if (!response.ok) continue;
 
       const data = await response.json();
@@ -325,14 +355,14 @@ async function resolveStreamWithInvidious(videoId) {
     try {
       const response = await fetchWithTimeout(
         `${instance}/api/v1/videos/${encodeURIComponent(videoId)}`,
-        4200
+        {},
+        4000
       );
       if (!response.ok) continue;
 
       const data = await response.json();
       if (!data.formatStreams && !data.adaptiveFormats) continue;
 
-      // Invidious supports ?local=true to proxy the stream through the Invidious server (bypasses IP lock)
       const toLocalProxyUrl = (rawUrl) => {
         if (!rawUrl) return null;
         try {
@@ -350,7 +380,7 @@ async function resolveStreamWithInvidious(videoId) {
       const audio = (data.adaptiveFormats || []).filter(
         (f) => f.type && f.type.startsWith('audio/') && f.url
       );
-      audio.sort((a, b) => ( parseInt(b.bitrate, 10) || 0 ) - ( parseInt(a.bitrate, 10) || 0 ));
+      audio.sort((a, b) => (parseInt(b.bitrate, 10) || 0) - (parseInt(a.bitrate, 10) || 0));
 
       const rawVideo = muxed[muxed.length - 1]?.url || null;
       const rawAudio = audio[0]?.url || rawVideo;
@@ -385,9 +415,98 @@ async function resolveStreamWithInvidious(videoId) {
 }
 
 /**
- * 3. Resolve streams via local yt-dlp binary (wraps URLs in /api/proxy to bypass IP-binding)
+ * 3. Direct YouTube Mobile InnerTube API Resolver (Fast, pure Node.js)
  */
-function resolveStreamWithYtDlp(queryOrId) {
+async function resolveStreamWithInnerTube(videoId) {
+  const clients = [
+    {
+      clientName: 'ANDROID_VR',
+      clientVersion: '1.60.19',
+      androidSdkVersion: 32,
+      userAgent:
+        'com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip',
+      osName: 'Android',
+      osVersion: '12L'
+    },
+    {
+      clientName: 'IOS',
+      clientVersion: '19.45.4',
+      deviceMake: 'Apple',
+      deviceModel: 'iPhone16,2',
+      userAgent: 'com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iOS 18_1_0 like Mac OS X;)',
+      osName: 'iPhone',
+      osVersion: '18.1.0.22B83'
+    }
+  ];
+
+  for (const client of clients) {
+    try {
+      const response = await fetchWithTimeout(
+        'https://www.youtube.com/youtubei/v1/player?prettyPrint=false',
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'User-Agent': client.userAgent
+          },
+          body: JSON.stringify({
+            videoId,
+            context: {
+              client: {
+                hl: 'en',
+                gl: 'US',
+                ...client
+              }
+            },
+            contentCheckOk: true,
+            racyCheckOk: true
+          })
+        },
+        5000
+      );
+
+      if (!response.ok) continue;
+      const data = await response.json();
+
+      if (data.playabilityStatus?.status !== 'OK' || !data.streamingData) continue;
+
+      const formats = (data.streamingData.formats || []).filter((f) => f.url);
+      const adaptive = (data.streamingData.adaptiveFormats || []).filter(
+        (f) => f.url && f.mimeType && f.mimeType.startsWith('audio/')
+      );
+      adaptive.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
+
+      const rawVideoUrl = formats[formats.length - 1]?.url || null;
+      const rawAudioUrl = adaptive[0]?.url || rawVideoUrl;
+
+      if (!rawVideoUrl && !rawAudioUrl) continue;
+
+      const wrapProxy = (u) => (u ? `/api/proxy?url=${encodeURIComponent(u)}` : null);
+      const details = data.videoDetails || {};
+
+      return {
+        id: videoId,
+        title: details.title || 'Untitled Track',
+        uploader: details.author || 'Unknown Artist',
+        duration: parseInt(details.lengthSeconds || '0', 10),
+        thumbnailUrl: `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
+        videoUrl: wrapProxy(rawVideoUrl || rawAudioUrl),
+        audioUrl: wrapProxy(rawAudioUrl || rawVideoUrl),
+        hlsUrl: data.streamingData.hlsManifestUrl || null,
+        related: [],
+        source: `innertube (${client.clientName})`
+      };
+    } catch (_) {}
+  }
+
+  throw new Error('InnerTube clients could not resolve direct URL');
+}
+
+/**
+ * 4. Fallback: Resolve streams via local yt-dlp binary
+ */
+async function resolveStreamWithYtDlp(queryOrId) {
+  await ensureYtDlpBinary();
   return new Promise((resolve, reject) => {
     const cleanId = extractVideoId(queryOrId);
     const target = cleanId ? `https://www.youtube.com/watch?v=${cleanId}` : `ytsearch1:${queryOrId}`;
@@ -435,7 +554,6 @@ function resolveStreamWithYtDlp(queryOrId) {
             return reject(new Error('No playable media formats found by yt-dlp'));
           }
 
-          // Proxy googlevideo URLs through our server so cloud IP-locked URLs work on client browsers
           const wrapProxy = (u) => (u ? `/api/proxy?url=${encodeURIComponent(u)}` : null);
 
           resolve({
@@ -460,7 +578,6 @@ function resolveStreamWithYtDlp(queryOrId) {
 
 /**
  * Byte-Range Media Stream Proxy (/api/proxy?url=...)
- * Ensures streams extracted by the cloud server's IP play without 403 Forbidden on user devices.
  */
 app.get('/api/proxy', (req, res) => {
   const targetUrl = req.query.url;
@@ -500,7 +617,7 @@ app.get('/api/proxy', (req, res) => {
     });
 
     req.on('close', () => proxyReq.destroy());
-  } catch (err) {
+  } catch (_) {
     res.status(400).send('Invalid stream URL');
   }
 });
@@ -595,10 +712,13 @@ app.get('/api/related/:id', async (req, res) => {
 
   if (!videoId) return res.status(400).json({ error: 'Invalid video ID' });
 
-  // 1. Try Piped
   for (const instance of PIPED_INSTANCES) {
     try {
-      const response = await fetchWithTimeout(`${instance}/streams/${encodeURIComponent(videoId)}`, 3800);
+      const response = await fetchWithTimeout(
+        `${instance}/streams/${encodeURIComponent(videoId)}`,
+        {},
+        3800
+      );
       if (!response.ok) continue;
       const data = await response.json();
       const related = normalizePipedItems(data.relatedStreams).filter((item) => item.id !== videoId);
@@ -606,11 +726,11 @@ app.get('/api/related/:id', async (req, res) => {
     } catch (_) {}
   }
 
-  // 2. Try Invidious recommendedVideos
   for (const instance of INVIDIOUS_INSTANCES) {
     try {
       const response = await fetchWithTimeout(
         `${instance}/api/v1/videos/${encodeURIComponent(videoId)}`,
+        {},
         3800
       );
       if (!response.ok) continue;
@@ -628,7 +748,6 @@ app.get('/api/related/:id', async (req, res) => {
     } catch (_) {}
   }
 
-  // 3. Fallback to keyword search for similar artist/tracks
   if (fallbackQuery) {
     try {
       const searchFallback = await searchWithPipedOrInvidious(fallbackQuery);
@@ -685,8 +804,8 @@ app.get('/api/stream/:query', async (req, res) => {
     return streamData;
   };
 
-  // 1. Try Piped Instances
   if (videoId) {
+    // 1. Try Piped Instances
     try {
       const pipedData = await resolveStreamWithPiped(videoId);
       return res.json(attachLibraryMeta(pipedData));
@@ -697,9 +816,15 @@ app.get('/api/stream/:query', async (req, res) => {
       const invData = await resolveStreamWithInvidious(videoId);
       return res.json(attachLibraryMeta(invData));
     } catch (_) {}
+
+    // 3. Try Direct YouTube Mobile InnerTube API
+    try {
+      const innerTubeData = await resolveStreamWithInnerTube(videoId);
+      return res.json(attachLibraryMeta(innerTubeData));
+    } catch (_) {}
   }
 
-  // 3. Try Local / Auto-Downloaded yt-dlp with Stream Proxy
+  // 4. Fallback to Local / Auto-Downloaded yt-dlp with Stream Proxy
   try {
     const fallbackData = await resolveStreamWithYtDlp(videoId || rawInput);
     return res.json(attachLibraryMeta(fallbackData));
@@ -715,7 +840,8 @@ app.get('/api/health', (_req, res) => {
   res.json({ status: 'ok', ytdlpBin: YTDLP_BIN, timestamp: new Date().toISOString() });
 });
 
-app.get('*', (_req, res) => {
+// Express 4 & Express 5 compatible SPA catch-all
+app.use((_req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
