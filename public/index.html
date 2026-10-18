@@ -188,6 +188,16 @@
       background: #000;
     }
 
+    #ytEmbedContainer,
+    #ytEmbedContainer iframe {
+      width: 100%;
+      height: 100%;
+      position: absolute;
+      inset: 0;
+      z-index: 3;
+      border: none;
+    }
+
     .artwork-stage {
       position: absolute;
       inset: 0;
@@ -224,7 +234,6 @@
       border-top: 1px solid var(--bg-elevated);
     }
 
-    /* Master Audio Element: Drives all sound so Android Chrome never pauses when screen locks */
     #bgAudioPlayer {
       width: 100%;
       height: 40px;
@@ -506,10 +515,9 @@
     <!-- Left Column: Master Audio + Synced Video Player -->
     <section class="player-section">
       <div class="video-stage">
-        <!-- Muted video element synced to master audio when video is available -->
         <video id="videoPlayer" muted playsinline preload="metadata"></video>
+        <div id="ytEmbedContainer" style="display: none;"></div>
 
-        <!-- Album Art Stage (Shown during Background-Ready Audio Mode) -->
         <div class="artwork-stage" id="artworkStage">
           <img id="overlayThumb" src="https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg" alt="Album Art" />
           <div style="font-weight: 600; color: var(--accent); font-size: 0.9rem;">
@@ -517,8 +525,7 @@
           </div>
         </div>
 
-        <!-- Master Audio Player: Always drives sound so Android Chrome never pauses on screen lock -->
-        <div class="audio-bar-wrapper">
+        <div class="audio-bar-wrapper" id="audioBarWrapper">
           <audio id="bgAudioPlayer" controls preload="auto"></audio>
         </div>
       </div>
@@ -572,6 +579,7 @@
     </aside>
   </main>
 
+  <script src="https://www.youtube.com/iframe_api"></script>
   <script src="/app.js"></script>
 </body>
 </html>

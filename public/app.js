@@ -5,7 +5,9 @@ const searchBtn = document.getElementById('searchBtn');
 
 const videoPlayer = document.getElementById('videoPlayer');
 const bgAudioPlayer = document.getElementById('bgAudioPlayer');
+const ytEmbedContainer = document.getElementById('ytEmbedContainer');
 const artworkStage = document.getElementById('artworkStage');
+const audioBarWrapper = document.getElementById('audioBarWrapper');
 const overlayThumb = document.getElementById('overlayThumb');
 
 const currentTitle = document.getElementById('currentTitle');
@@ -26,6 +28,9 @@ const resultsList = document.getElementById('resultsList');
 // Application State
 let currentStream = null;
 let activeTab = 'mostPlayed';
+let activeEngine = 'direct'; // 'direct' | 'embed'
+let ytPlayer = null;
+let ytApiReady = false;
 
 let mostPlayedList = [];
 let favoritesList = [];
@@ -43,6 +48,50 @@ if (localStorage.getItem('cleantube_autoplay_similar') !== null) {
 }
 if (localStorage.getItem('cleantube_repeat') === 'true') {
   repeatToggle.checked = true;
+}
+
+window.onYouTubeIframeAPIReady = function () {
+  ytApiReady = true;
+};
+
+function ensureYtPlayer(videoId) {
+  return new Promise((resolve) => {
+    if (ytPlayer && typeof ytPlayer.loadVideoById === 'function') {
+      ytPlayer.loadVideoById(videoId);
+      return resolve(ytPlayer);
+    }
+
+    const create = () => {
+      ytPlayer = new YT.Player('ytEmbedContainer', {
+        height: '100%',
+        width: '100%',
+        videoId,
+        host: 'https://www.youtube-nocookie.com',
+        playerVars: { autoplay: 1, playsinline: 1, rel: 0 },
+        events: {
+          onReady: (e) => {
+            e.target.playVideo();
+            resolve(ytPlayer);
+          },
+          onStateChange: (e) => {
+            if (e.data === 0) handleTrackEnded();
+          }
+        }
+      });
+    };
+
+    if (ytApiReady && window.YT && window.YT.Player) {
+      create();
+    } else {
+      const timer = setInterval(() => {
+        if (window.YT && window.YT.Player) {
+          clearInterval(timer);
+          ytApiReady = true;
+          create();
+        }
+      }, 150);
+    }
+  });
 }
 
 function getCoreTitle(rawTitle = '', uploader = '') {
@@ -367,16 +416,10 @@ async function performSearch(query) {
   }
 }
 
-/**
- * Master Audio Player Loader:
- * Always plays sound via <audio id="bgAudioPlayer"> from second 0 so Android Chrome
- * treats the tab as a native audio player and never suspends it when the screen locks!
- */
 async function loadAndPlayStream(queryOrId) {
   searchBtn.disabled = true;
-  playbackStatus.textContent = 'Resolving background audio stream...';
+  playbackStatus.textContent = 'Loading background audio stream...';
 
-  // Unlock bgAudioPlayer immediately inside the user's tap gesture on mobile
   try {
     bgAudioPlayer.pause();
   } catch (_) {}
@@ -385,8 +428,8 @@ async function loadAndPlayStream(queryOrId) {
     const response = await fetch(`/api/stream/${encodeURIComponent(queryOrId)}`);
     const data = await response.json();
 
-    if (!response.ok || !data.audioUrl) {
-      throw new Error(data.error || 'Could not resolve direct audio stream');
+    if (!response.ok) {
+      throw new Error(data.error || 'Could not load track');
     }
 
     currentStream = data;
@@ -408,30 +451,55 @@ async function loadAndPlayStream(queryOrId) {
     similarList = [];
     fetchSimilarTracks(data);
 
-    // 1. Start Master Audio Stream (<audio>)
-    bgAudioPlayer.src = data.audioUrl;
-    await bgAudioPlayer.play();
-    playbackStatus.textContent = 'Playing (Background Ready)';
+    if (data.audioUrl) {
+      activeEngine = 'direct';
+      if (ytPlayer && typeof ytPlayer.stopVideo === 'function') {
+        ytPlayer.stopVideo();
+      }
+      ytEmbedContainer.style.display = 'none';
+      audioBarWrapper.style.display = 'block';
 
-    // 2. If a video stream is also present and tab is visible, play muted video synced to audio
-    if (data.videoUrl && document.visibilityState === 'visible') {
-      artworkStage.classList.add('hidden');
-      videoPlayer.src = data.videoUrl;
-      videoPlayer.currentTime = 0;
-      videoPlayer.play().catch(() => {});
+      bgAudioPlayer.src = data.audioUrl;
+      await bgAudioPlayer.play();
+      playbackStatus.textContent = 'Playing (Background Ready)';
+
+      if (data.videoUrl && document.visibilityState === 'visible') {
+        artworkStage.classList.add('hidden');
+        videoPlayer.src = data.videoUrl;
+        videoPlayer.currentTime = 0;
+        videoPlayer.play().catch(() => {});
+      } else {
+        videoPlayer.pause();
+        videoPlayer.removeAttribute('src');
+        artworkStage.classList.remove('hidden');
+      }
     } else {
+      activeEngine = 'embed';
       videoPlayer.pause();
-      videoPlayer.removeAttribute('src');
-      artworkStage.classList.remove('hidden');
+      bgAudioPlayer.pause();
+      artworkStage.classList.add('hidden');
+      audioBarWrapper.style.display = 'none';
+      ytEmbedContainer.style.display = 'block';
+      await ensureYtPlayer(data.id);
+      playbackStatus.textContent = 'Playing';
     }
   } catch (err) {
-    playbackStatus.textContent = `Error: ${err.message}`;
+    // If direct audio stream fails on a rare non-music clip, fallback to embed instead of stopping
+    if (currentStream && currentStream.id) {
+      activeEngine = 'embed';
+      artworkStage.classList.add('hidden');
+      audioBarWrapper.style.display = 'none';
+      ytEmbedContainer.style.display = 'block';
+      await ensureYtPlayer(currentStream.id);
+      playbackStatus.textContent = 'Playing (Embed Fallback)';
+    } else {
+      playbackStatus.textContent = `Error: ${err.message}`;
+    }
   } finally {
     searchBtn.disabled = false;
   }
 }
 
-// Keep muted <video> synced with master <audio> while screen is on
 bgAudioPlayer.addEventListener('play', () => {
   if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'playing';
   if (currentStream?.videoUrl && document.visibilityState === 'visible') {
@@ -463,25 +531,36 @@ bgAudioPlayer.addEventListener('timeupdate', () => {
   }
 });
 
-// When screen locks on Android, pause only the muted video; bgAudioPlayer keeps playing uninterrupted!
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'hidden') {
     videoPlayer.pause();
-  } else if (document.visibilityState === 'visible' && currentStream?.videoUrl && !bgAudioPlayer.paused) {
+  } else if (
+    document.visibilityState === 'visible' &&
+    activeEngine === 'direct' &&
+    currentStream?.videoUrl &&
+    !bgAudioPlayer.paused
+  ) {
     videoPlayer.currentTime = bgAudioPlayer.currentTime;
     videoPlayer.play().catch(() => {});
   }
 });
 
-bgAudioPlayer.addEventListener('ended', () => {
+function handleTrackEnded() {
   if (repeatToggle.checked && currentStream) {
-    bgAudioPlayer.currentTime = 0;
-    bgAudioPlayer.play();
+    if (activeEngine === 'direct') {
+      bgAudioPlayer.currentTime = 0;
+      bgAudioPlayer.play();
+    } else if (ytPlayer) {
+      ytPlayer.seekTo(0);
+      ytPlayer.playVideo();
+    }
     recordTrackPlay(currentStream);
     return;
   }
   playNextTrackOrSimilar();
-});
+}
+
+bgAudioPlayer.addEventListener('ended', handleTrackEnded);
 
 async function playNextTrackOrSimilar() {
   if (autoplaySimilarToggle.checked && currentStream) {
@@ -538,8 +617,15 @@ function configureMediaSession(streamData) {
       : []
   });
 
-  navigator.mediaSession.setActionHandler('play', () => bgAudioPlayer.play());
-  navigator.mediaSession.setActionHandler('pause', () => bgAudioPlayer.pause());
+  navigator.mediaSession.setActionHandler('play', () => {
+    if (activeEngine === 'direct') bgAudioPlayer.play();
+    else if (ytPlayer) ytPlayer.playVideo();
+  });
+
+  navigator.mediaSession.setActionHandler('pause', () => {
+    if (activeEngine === 'direct') bgAudioPlayer.pause();
+    else if (ytPlayer) ytPlayer.pauseVideo();
+  });
 
   navigator.mediaSession.setActionHandler('seekbackward', (details) => {
     const offset = details.seekOffset || 10;
