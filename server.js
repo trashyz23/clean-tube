@@ -442,78 +442,32 @@ app.get('/api/related/:id', async (req, res) => {
 // Search & Stream Endpoints
 // ============================================================================
 
+const YouTube = require('youtube-sr').default;
+
 app.get('/api/search', async (req, res) => {
   const query = req.query.q;
   if (!query) return res.status(400).json({ error: 'Query required' });
 
   try {
-    // Direct YouTube suggestion/search endpoint (unrestricted)
-    const ytUrl = `https://suggestqueries.google.com/complete/search?client=firefox&ds=yt&q=${encodeURIComponent(query)}`;
-    const response = await fetch(ytUrl);
-    const data = await response.json();
+    // Выполняем поиск видео с помощью youtube-sr
+    const videos = await YouTube.search(query, { limit: 15, type: 'video' });
 
-    // Extract query suggestions
-    const suggestions = data[1] || [];
-
-    if (suggestions.length === 0) {
-      // Fallback search using Invidious HTML scraping
-      const htmlRes = await fetch(`https://yewtu.be/search?q=${encodeURIComponent(query)}`);
-      const htmlText = await htmlRes.text();
-      const videoIds = [...htmlText.matchAll(/\/watch\?v=([a-zA-Z0-9_-]{11})/g)].map(m => m[1]);
-      const uniqueIds = [...new Set(videoIds)];
-
-      const results = uniqueIds.slice(0, 10).map(id => ({
-        id,
-        title: `${query} (Track ${id.substring(0, 4)})`,
-        thumbnail: `https://i.ytimg.com/vi/${id}/hqdefault.jpg`,
-        uploaderName: 'YouTube Music',
-        duration: 0
-      }));
-      return res.json(results);
+    if (!videos || videos.length === 0) {
+      return res.json([]);
     }
 
-    // Fetch video results for top suggestions via invidious/piped fallback array
-    const searchEndpoints = [
-      'https://inv.riverside.rocks/api/v1/search?q=',
-      'https://invidious.drgns.space/api/v1/search?q=',
-      'https://vid.puffyan.us/api/v1/search?q='
-    ];
+    const results = videos.map(video => ({
+      id: video.id,
+      title: video.title,
+      thumbnail: video.thumbnail?.url || `https://i.ytimg.com/vi/${video.id}/hqdefault.jpg`,
+      uploaderName: video.channel?.name || 'YouTube',
+      duration: Math.floor((video.duration || 0) / 1000)
+    })).filter(item => item.id);
 
-    for (const endpoint of searchEndpoints) {
-      try {
-        const resSearch = await fetch(`${endpoint}${encodeURIComponent(query)}`, { signal: AbortSignal.timeout(4000) });
-        if (!resSearch.ok) continue;
-        const searchData = await resSearch.json();
-        if (Array.isArray(searchData) && searchData.length > 0) {
-          const formatted = searchData.slice(0, 15).map(item => ({
-            id: item.videoId,
-            title: item.title,
-            thumbnail: item.videoThumbnails?.[0]?.url || `https://i.ytimg.com/vi/${item.videoId}/hqdefault.jpg`,
-            uploaderName: item.author,
-            duration: item.lengthSeconds
-          })).filter(i => i.id);
-          if (formatted.length > 0) return res.json(formatted);
-        }
-      } catch (e) {
-        continue;
-      }
-    }
-
-    // Final fallback: return clickable direct video items generated from standard IDs
-    const fallbackItems = suggestions.slice(0, 8).map((term, index) => ({
-      id: '', // Will trigger direct play on click
-      title: term,
-      thumbnail: 'https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?w=300',
-      uploaderName: 'Search Suggestion',
-      duration: 0,
-      query: term
-    }));
-
-    return res.json(fallbackItems);
-
+    return res.json(results);
   } catch (err) {
-    console.error('Search endpoint error:', err);
-    res.status(500).json({ error: err.message });
+    console.error('Search error:', err);
+    return res.status(500).json({ error: 'Search failed: ' + err.message });
   }
 });
 
