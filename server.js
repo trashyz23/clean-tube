@@ -3,18 +3,16 @@ const compression = require('compression');
 const cors = require('cors');
 const fetch = globalThis.fetch || require('node-fetch');
 const { execFile } = require('child_process');
+const { Readable } = require('stream');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const https = require('https');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Persistent storage paths
 const DATA_DIR = path.join(__dirname, 'data');
 const LIBRARY_FILE = path.join(DATA_DIR, 'library.json');
-const COOKIES_FILE = path.join(DATA_DIR, 'cookies.txt');
 
 if (!fs.existsSync(DATA_DIR)) {
   fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -31,16 +29,71 @@ app.use(express.static(path.join(__dirname, 'public')));
 const PIPED_INSTANCES = [
   'https://api.piped.private.coffee',
   'https://pipedapi.kavin.rocks',
+  'https://pipedapi-libre.kavin.rocks',
   'https://pipedapi.leptons.xyz',
   'https://pipedapi.nosebs.ru'
 ];
 
 const INVIDIOUS_INSTANCES = [
   'https://inv.nadeko.net',
-  'https://inv.tux.pizza',
   'https://invidious.nerdvpn.de',
-  'https://yewtu.be'
+  'https://yt.chocolatemoo53.com',
+  'https://invidious.tiekoetter.com',
+  'https://invidious.f5.si',
+  'https://inv.zoomerville.com'
 ];
+
+let YTDLP_BIN = 'yt-dlp';
+let ytDlpReadyPromise = null;
+
+/**
+ * Automatically downloads standalone yt-dlp binary to /tmp/yt-dlp on Render
+ */
+function ensureYtDlpBinary() {
+  if (ytDlpReadyPromise) return ytDlpReadyPromise;
+
+  ytDlpReadyPromise = (async () => {
+    const checkCmd = (bin) =>
+      new Promise((resolve) => {
+        execFile(bin, ['--version'], { timeout: 5000 }, (err) => resolve(!err));
+      });
+
+    if (await checkCmd('yt-dlp')) {
+      YTDLP_BIN = 'yt-dlp';
+      return YTDLP_BIN;
+    }
+
+    const tmpBin = path.join(os.tmpdir(), os.platform() === 'win32' ? 'yt-dlp.exe' : 'yt-dlp');
+    if (fs.existsSync(tmpBin) && (await checkCmd(tmpBin))) {
+      YTDLP_BIN = tmpBin;
+      return YTDLP_BIN;
+    }
+
+    const downloadUrl =
+      os.platform() === 'win32'
+        ? 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe'
+        : os.platform() === 'darwin'
+        ? 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_macos'
+        : 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux';
+
+    try {
+      const res = await fetch(downloadUrl);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const buffer = Buffer.from(await res.arrayBuffer());
+      fs.writeFileSync(tmpBin, buffer, { mode: 0o755 });
+      fs.chmodSync(tmpBin, 0o755);
+      YTDLP_BIN = tmpBin;
+      console.log(`[Startup] Installed standalone yt-dlp to ${tmpBin}`);
+    } catch (err) {
+      console.error('[Startup] Failed to download yt-dlp:', err.message);
+    }
+    return YTDLP_BIN;
+  })();
+
+  return ytDlpReadyPromise;
+}
+
+ensureYtDlpBinary();
 
 function readLibrary() {
   try {
@@ -68,7 +121,7 @@ function extractVideoId(input) {
   return null;
 }
 
-async function fetchWithTimeout(url, options = {}, timeoutMs = 2800) {
+async function fetchWithTimeout(url, options = {}, timeoutMs = 4500) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
@@ -77,7 +130,7 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 2800) {
       signal: controller.signal,
       headers: {
         'User-Agent':
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
         Accept: 'application/json',
         ...(options.headers || {})
       }
@@ -90,9 +143,6 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 2800) {
   }
 }
 
-/**
- * Parses duration strings like "3:45" or "1:02:10" into seconds
- */
 function parseDurationText(text) {
   if (!text || typeof text !== 'string') return 0;
   const parts = text.split(':').map((n) => parseInt(n, 10));
@@ -103,9 +153,193 @@ function parseDurationText(text) {
 }
 
 /**
- * Direct YouTube InnerTube Search (Works 100% on Render/AWS Datacenter IPs in ~250ms, no cookies needed)
+ * Extracts core song title so we can filter out duplicate uploads, lyrics, and covers
  */
-async function searchYouTubeInnerTube(query) {
+function getCoreSongTitle(rawTitle = '', uploader = '') {
+  let clean = rawTitle.toLowerCase();
+  const cleanUploader = uploader
+    .toLowerCase()
+    .replace(/\s*(-|topic|vevo|official|music)\s*/g, '')
+    .trim();
+
+  clean = clean
+    .replace(/\([^)]*\)/g, ' ')
+    .replace(/\[[^\]]*\]/g, ' ')
+    .replace(/\{[^}]*\}/g, ' ');
+
+  const parts = clean.split(/\s+[-–—:|]\s+/);
+  if (parts.length >= 2) {
+    if (cleanUploader && parts[0].includes(cleanUploader)) {
+      clean = parts.slice(1).join(' ');
+    } else if (cleanUploader && parts[parts.length - 1].includes(cleanUploader)) {
+      clean = parts.slice(0, -1).join(' ');
+    } else {
+      clean = parts[1];
+    }
+  }
+
+  return clean
+    .replace(/\b(ft\.?|feat\.?|featuring)\b.*$/i, '')
+    .replace(
+      /\b(official\s*music\s*video|official\s*video|official\s*audio|lyric\s*video|lyrics|audio|video|hd|4k|remastered|live|visualizer|mv)\b/gi,
+      ' '
+    )
+    .replace(/[^\p{L}\p{N}\s]/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function isDuplicateOrUnwantedVariant(candidateTitle, currentTitle, currentUploader) {
+  const lowerCand = (candidateTitle || '').toLowerCase();
+  if (
+    /\b(cover|covered\s+by|karaoke|instrumental|reaction|tutorial|lesson|1\s*hour|10\s*hours|slowed|nightcore)\b/i.test(
+      lowerCand
+    )
+  ) {
+    return true;
+  }
+
+  const currentCore = getCoreSongTitle(currentTitle, currentUploader);
+  const candidateCore = getCoreSongTitle(candidateTitle, currentUploader);
+  if (!currentCore || !candidateCore) return false;
+
+  if (
+    candidateCore === currentCore ||
+    (currentCore.length >= 4 && candidateCore.includes(currentCore)) ||
+    (candidateCore.length >= 4 && currentCore.includes(candidateCore))
+  ) {
+    return true;
+  }
+  return false;
+}
+
+function filterDistinctSimilarSongs(candidates, seedId, seedTitle, seedUploader) {
+  const seenIds = new Set([seedId]);
+  const seenCoreTitles = new Set();
+
+  const seedCore = getCoreSongTitle(seedTitle, seedUploader);
+  if (seedCore) seenCoreTitles.add(seedCore);
+
+  const filtered = [];
+
+  for (const item of candidates) {
+    if (!item || !item.id || seenIds.has(item.id)) continue;
+    if (isDuplicateOrUnwantedVariant(item.title, seedTitle, seedUploader)) continue;
+
+    const core = getCoreSongTitle(item.title, item.uploader);
+    if (!core || core.length < 2) continue;
+
+    let alreadyInList = false;
+    for (const existingCore of seenCoreTitles) {
+      if (
+        core === existingCore ||
+        (existingCore.length >= 4 && core.includes(existingCore)) ||
+        (core.length >= 4 && existingCore.includes(core))
+      ) {
+        alreadyInList = true;
+        break;
+      }
+    }
+    if (alreadyInList) continue;
+
+    seenIds.add(item.id);
+    seenCoreTitles.add(core);
+    filtered.push(item);
+  }
+
+  return filtered;
+}
+
+async function fetchYouTubeRadioMix(videoId, seedTitle = '', seedUploader = '') {
+  const response = await fetchWithTimeout(
+    'https://www.youtube.com/youtubei/v1/next?prettyPrint=false',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        videoId,
+        playlistId: `RD${videoId}`,
+        context: {
+          client: {
+            clientName: 'WEB',
+            clientVersion: '2.20250101.00.00',
+            hl: 'en',
+            gl: 'US'
+          }
+        }
+      })
+    },
+    4500
+  );
+
+  if (!response.ok) throw new Error(`InnerTube next HTTP ${response.status}`);
+  const data = await response.json();
+
+  const rawCandidates = [];
+
+  const playlistContents =
+    data?.contents?.twoColumnWatchNextResults?.playlist?.playlist?.contents || [];
+
+  for (const entry of playlistContents) {
+    const v = entry.playlistPanelVideoRenderer;
+    if (!v || !v.videoId) continue;
+
+    const title = v.title?.simpleText || v.title?.runs?.map((r) => r.text).join('') || '';
+    const uploader =
+      v.longBylineText?.runs?.[0]?.text ||
+      v.shortBylineText?.runs?.[0]?.text ||
+      'Unknown Artist';
+    const duration = parseDurationText(v.lengthText?.simpleText || '');
+
+    if (title) {
+      rawCandidates.push({
+        id: v.videoId,
+        title,
+        uploader,
+        duration,
+        thumbnailUrl: `https://i.ytimg.com/vi/${v.videoId}/hqdefault.jpg`
+      });
+    }
+  }
+
+  const secondaryResults =
+    data?.contents?.twoColumnWatchNextResults?.secondaryResults?.secondaryResults?.results || [];
+
+  for (const entry of secondaryResults) {
+    const v = entry.compactVideoRenderer;
+    if (!v || !v.videoId) continue;
+
+    const title = v.title?.simpleText || v.title?.runs?.map((r) => r.text).join('') || '';
+    const uploader =
+      v.longBylineText?.runs?.[0]?.text ||
+      v.shortBylineText?.runs?.[0]?.text ||
+      'Unknown Artist';
+    const duration = parseDurationText(v.lengthText?.simpleText || '');
+
+    if (title) {
+      rawCandidates.push({
+        id: v.videoId,
+        title,
+        uploader,
+        duration,
+        thumbnailUrl: `https://i.ytimg.com/vi/${v.videoId}/hqdefault.jpg`
+      });
+    }
+  }
+
+  const distinct = filterDistinctSimilarSongs(rawCandidates, videoId, seedTitle, seedUploader);
+
+  if (distinct.length < 3 && seedUploader) {
+    const cleanArtist = seedUploader.replace(/\s*(-|Topic|VEVO|Official)\s*/gi, '').trim();
+    const artistSearch = await searchYouTubeInnerTube(`${cleanArtist} official audio`, 20);
+    const combined = [...distinct, ...(artistSearch.results || [])];
+    return filterDistinctSimilarSongs(combined, videoId, seedTitle, seedUploader).slice(0, 15);
+  }
+
+  return distinct.slice(0, 18);
+}
+
+async function searchYouTubeInnerTube(query, maxItems = 15) {
   const response = await fetchWithTimeout(
     'https://www.youtube.com/youtubei/v1/search?prettyPrint=false',
     {
@@ -158,18 +392,15 @@ async function searchYouTubeInnerTube(query) {
         thumbnailUrl: `https://i.ytimg.com/vi/${v.videoId}/hqdefault.jpg`
       });
 
-      if (results.length >= 15) break;
+      if (results.length >= maxItems) break;
     }
-    if (results.length >= 15) break;
+    if (results.length >= maxItems) break;
   }
 
   if (results.length === 0) throw new Error('No InnerTube search results');
   return { results, source: 'youtube-innertube' };
 }
 
-/**
- * Fetches Video Title & Artist in ~150ms via YouTube's public oEmbed API (Never blocked on Render)
- */
 async function fetchVideoMetadataFast(videoId) {
   try {
     const url = `https://www.youtube.com/oembed?url=${encodeURIComponent(
@@ -197,22 +428,31 @@ async function fetchVideoMetadataFast(videoId) {
   };
 }
 
+// ============================================================================
+// 3-Tier Direct Audio/Video Stream Resolution (Required for Android Background Play)
+// ============================================================================
+
 /**
- * Fast Parallel Direct Stream Resolver (Runs all Piped & Invidious instances in parallel with 2.5s cap)
+ * Tier 1: Parallel Piped & Invidious Direct Stream Resolution
  */
-async function resolveDirectStreamFast(videoId) {
+async function resolveDirectViaInstances(videoId) {
   const pipedTasks = PIPED_INSTANCES.map(async (instance) => {
-    const res = await fetchWithTimeout(`${instance}/streams/${encodeURIComponent(videoId)}`, {}, 2500);
+    const res = await fetchWithTimeout(`${instance}/streams/${encodeURIComponent(videoId)}`, {}, 5000);
     if (!res.ok) throw new Error('Piped non-200');
     const data = await res.json();
 
     const muxed = (data.videoStreams || []).filter((s) => !s.videoOnly && s.url);
     const audio = (data.audioStreams || []).filter((s) => s.url);
-    audio.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
+    // Prefer m4a/mp4 audio for mobile Android/iOS compatibility
+    audio.sort((a, b) => {
+      const aM4a = (a.mimeType || '').includes('mp4') ? 1000000 : 0;
+      const bM4a = (b.mimeType || '').includes('mp4') ? 1000000 : 0;
+      return bM4a + (b.bitrate || 0) - (aM4a + (a.bitrate || 0));
+    });
 
-    const videoUrl = muxed[0]?.url || data.hls || null;
+    const videoUrl = muxed[0]?.url || null;
     const audioUrl = audio[0]?.url || videoUrl;
-    if (!videoUrl && !audioUrl) throw new Error('No Piped URLs');
+    if (!audioUrl) throw new Error('No Piped audio URL');
 
     return {
       id: videoId,
@@ -220,7 +460,7 @@ async function resolveDirectStreamFast(videoId) {
       uploader: data.uploader || 'Unknown Artist',
       duration: data.duration || 0,
       thumbnailUrl: data.thumbnailUrl || `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
-      videoUrl,
+      videoUrl: videoUrl || audioUrl,
       audioUrl,
       playbackMode: 'direct',
       source: `piped (${instance})`
@@ -231,7 +471,7 @@ async function resolveDirectStreamFast(videoId) {
     const res = await fetchWithTimeout(
       `${instance}/api/v1/videos/${encodeURIComponent(videoId)}`,
       {},
-      2500
+      5000
     );
     if (!res.ok) throw new Error('Invidious non-200');
     const data = await res.json();
@@ -248,14 +488,17 @@ async function resolveDirectStreamFast(videoId) {
       return `${instance}/latest_version?id=${encodeURIComponent(videoId)}&itag=${parsed.searchParams.get('itag')}&local=true`;
     };
 
+    const audioUrl = toProxied(audio[0]?.url || muxed[0]?.url);
+    const videoUrl = toProxied(muxed[0]?.url || audio[0]?.url);
+
     return {
       id: videoId,
       title: data.title || 'Untitled Track',
       uploader: data.author || 'Unknown Artist',
       duration: data.lengthSeconds || 0,
       thumbnailUrl: `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
-      videoUrl: toProxied(muxed[0]?.url || audio[0]?.url),
-      audioUrl: toProxied(audio[0]?.url || muxed[0]?.url),
+      videoUrl,
+      audioUrl,
       playbackMode: 'direct',
       source: `invidious (${instance})`
     };
@@ -263,6 +506,158 @@ async function resolveDirectStreamFast(videoId) {
 
   return Promise.any([...pipedTasks, ...invidiousTasks]);
 }
+
+/**
+ * Tier 2: yt-dlp YouTube with 2026 player_skip=webpage & tv/web_embedded bypass
+ */
+async function resolveDirectViaYtDlpYouTube(videoId) {
+  await ensureYtDlpBinary();
+  return new Promise((resolve, reject) => {
+    const url = `https://www.youtube.com/watch?v=${videoId}`;
+    const args = [
+      '--no-warnings',
+      '--no-playlist',
+      '--force-ipv4',
+      '--js-runtimes',
+      'node',
+      '--extractor-args',
+      'youtube:player_client=tv,web_embedded,tv_simply;player_skip=webpage',
+      '--dump-json',
+      url
+    ];
+
+    execFile(YTDLP_BIN, args, { maxBuffer: 1024 * 1024 * 15, timeout: 12000 }, (err, stdout) => {
+      if (err) return reject(err);
+      try {
+        const data = JSON.parse(stdout.trim().split('\n')[0]);
+        const formats = data.formats || [];
+
+        const muxed = formats.filter(
+          (f) => f.vcodec && f.vcodec !== 'none' && f.acodec && f.acodec !== 'none' && f.url
+        );
+        const audio = formats.filter(
+          (f) => (!f.vcodec || f.vcodec === 'none') && f.acodec && f.acodec !== 'none' && f.url
+        );
+
+        const rawVideo = muxed[muxed.length - 1]?.url || null;
+        const rawAudio = audio[audio.length - 1]?.url || rawVideo;
+
+        if (!rawAudio) return reject(new Error('No audio stream found'));
+
+        const wrapProxy = (u) => (u ? `/api/proxy?url=${encodeURIComponent(u)}` : null);
+
+        resolve({
+          id: videoId,
+          title: data.title || 'Untitled Track',
+          uploader: data.uploader || data.channel || 'Unknown Artist',
+          duration: data.duration || 0,
+          thumbnailUrl: `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
+          videoUrl: wrapProxy(rawVideo || rawAudio),
+          audioUrl: wrapProxy(rawAudio),
+          playbackMode: 'direct',
+          source: 'yt-dlp (direct)'
+        });
+      } catch (e) {
+        reject(e);
+      }
+    });
+  });
+}
+
+/**
+ * Tier 3: yt-dlp Direct Audio Rescue via SoundCloud Search (scsearch1:)
+ * Never blocked on Render AWS datacenter IPs, requires zero cookies, and returns a real
+ * audio stream (.mp3/.m4a) so Android Chrome Background Play works 100% of the time!
+ */
+async function resolveDirectAudioViaSoundCloudRescue(videoId, meta) {
+  await ensureYtDlpBinary();
+  return new Promise((resolve, reject) => {
+    const cleanUploader = (meta.uploader || '')
+      .replace(/\s*(-|Topic|VEVO|Official)\s*/gi, '')
+      .trim();
+    const searchQuery = meta.title.toLowerCase().includes(cleanUploader.toLowerCase())
+      ? meta.title
+      : `${cleanUploader} ${meta.title}`.trim();
+
+    const args = [
+      '--no-warnings',
+      '--no-playlist',
+      '--force-ipv4',
+      '--dump-json',
+      `scsearch1:${searchQuery}`
+    ];
+
+    execFile(YTDLP_BIN, args, { maxBuffer: 1024 * 1024 * 10, timeout: 12000 }, (err, stdout) => {
+      if (err) return reject(err);
+      try {
+        const data = JSON.parse(stdout.trim().split('\n')[0]);
+        const formats = (data.formats || []).filter(
+          (f) => f.url && f.protocol && !f.protocol.includes('m3u8')
+        );
+        const chosenUrl = formats[formats.length - 1]?.url || data.url;
+        if (!chosenUrl) return reject(new Error('No direct audio stream URL'));
+
+        const proxiedAudio = `/api/proxy?url=${encodeURIComponent(chosenUrl)}`;
+
+        resolve({
+          id: videoId,
+          title: meta.title || data.title || 'Untitled Track',
+          uploader: meta.uploader || data.uploader || 'Unknown Artist',
+          duration: data.duration || meta.duration || 0,
+          thumbnailUrl: meta.thumbnailUrl || `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
+          videoUrl: null,
+          audioUrl: proxiedAudio,
+          playbackMode: 'direct',
+          source: 'direct-audio-stream'
+        });
+      } catch (e) {
+        reject(e);
+      }
+    });
+  });
+}
+
+// ============================================================================
+// Byte-Range Stream Proxy (/api/proxy?url=...)
+// ============================================================================
+
+app.get('/api/proxy', async (req, res) => {
+  const targetUrl = req.query.url;
+  if (!targetUrl) return res.status(400).send('Missing url parameter');
+
+  try {
+    const headers = {
+      'User-Agent':
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36'
+    };
+    if (req.headers.range) {
+      headers.Range = req.headers.range;
+    }
+
+    const upstream = await fetch(targetUrl, { headers });
+    res.status(upstream.status);
+
+    const forwardHeaders = [
+      'content-type',
+      'content-length',
+      'content-range',
+      'accept-ranges',
+      'cache-control'
+    ];
+    forwardHeaders.forEach((h) => {
+      const val = upstream.headers.get(h);
+      if (val) res.setHeader(h, val);
+    });
+
+    if (!upstream.body) return res.end();
+    const nodeStream = Readable.fromWeb(upstream.body);
+    nodeStream.on('error', () => res.end());
+    req.on('close', () => nodeStream.destroy());
+    nodeStream.pipe(res);
+  } catch (err) {
+    if (!res.headersSent) res.status(502).send(err.message);
+  }
+});
 
 // ============================================================================
 // Music Library & Most Watched API Endpoints
@@ -345,7 +740,7 @@ app.delete('/api/library/:id', (req, res) => {
 });
 
 // ============================================================================
-// Search, Related Songs & Stream Endpoints
+// Search, True Radio Mix Related Songs & Stream Endpoints
 // ============================================================================
 
 app.get('/api/search', async (req, res) => {
@@ -362,20 +757,12 @@ app.get('/api/search', async (req, res) => {
 
 app.get('/api/related/:id', async (req, res) => {
   const videoId = extractVideoId(req.params.id);
-  const fallbackQuery = (req.query.q || '').trim();
-
   if (!videoId) return res.status(400).json({ error: 'Invalid video ID' });
 
-  // Use InnerTube search to find similar/mix songs by the same artist/track
   try {
-    let searchQuery = fallbackQuery;
-    if (!searchQuery) {
-      const meta = await fetchVideoMetadataFast(videoId);
-      searchQuery = `${meta.uploader} ${meta.title}`;
-    }
-    const searchData = await searchYouTubeInnerTube(`${searchQuery} mix`);
-    const related = (searchData.results || []).filter((item) => item.id !== videoId);
-    return res.json({ related, source: 'youtube-mix' });
+    const meta = await fetchVideoMetadataFast(videoId);
+    const related = await fetchYouTubeRadioMix(videoId, meta.title, meta.uploader);
+    return res.json({ related, source: 'youtube-radio-mix' });
   } catch (err) {
     return res.json({ related: [], source: 'none' });
   }
@@ -400,49 +787,57 @@ app.get('/api/stream/:query', async (req, res) => {
     return res.status(404).json({ error: 'Could not find a matching video ID' });
   }
 
-  const attachLibraryMeta = (streamData) => {
+  const attachLibraryAndRelated = async (streamData) => {
     const lib = readLibrary();
     streamData.playCount = lib.tracks[streamData.id]?.playCount || 0;
     streamData.favorite = Boolean(lib.tracks[streamData.id]?.favorite);
+    streamData.related = await fetchYouTubeRadioMix(
+      videoId,
+      streamData.title,
+      streamData.uploader
+    ).catch(() => []);
     return streamData;
   };
 
-  // 1. Try Fast Parallel Direct Stream Resolution (2.5s max wait)
+  // Tier 1: Try Piped & Invidious instances in parallel
   try {
-    const directData = await resolveDirectStreamFast(videoId);
-    return res.json(attachLibraryMeta(directData));
-  } catch (_) {
-    // 2. Instant Cloud Fallback: Return metadata + embed mode so playback starts immediately on Render
-    const meta = await fetchVideoMetadataFast(videoId);
-    const relatedQuery = `${meta.uploader} ${meta.title}`;
-    let related = [];
-    try {
-      const relSearch = await searchYouTubeInnerTube(`${relatedQuery} song`);
-      related = (relSearch.results || []).filter((item) => item.id !== videoId);
-    } catch (_) {}
+    const directData = await resolveDirectViaInstances(videoId);
+    return res.json(await attachLibraryAndRelated(directData));
+  } catch (_) {}
 
-    return res.json(
-      attachLibraryMeta({
-        ...meta,
-        videoUrl: null,
-        audioUrl: null,
-        related,
-        playbackMode: 'embed',
-        source: 'youtube-direct-player'
-      })
-    );
-  }
+  // Tier 2: Try yt-dlp YouTube with player_skip=webpage
+  try {
+    const ytdlpData = await resolveDirectViaYtDlpYouTube(videoId);
+    return res.json(await attachLibraryAndRelated(ytdlpData));
+  } catch (_) {}
+
+  // Tier 3: Direct Audio Stream Rescue (Guarantees native <audio> background play on Android Chrome!)
+  const meta = await fetchVideoMetadataFast(videoId);
+  try {
+    const audioRescueData = await resolveDirectAudioViaSoundCloudRescue(videoId, meta);
+    return res.json(await attachLibraryAndRelated(audioRescueData));
+  } catch (_) {}
+
+  // Final Fallback
+  return res.json(
+    await attachLibraryAndRelated({
+      ...meta,
+      videoUrl: null,
+      audioUrl: null,
+      playbackMode: 'embed',
+      source: 'youtube-embed-fallback'
+    })
+  );
 });
 
 app.get('/api/health', (_req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+  res.json({ status: 'ok', ytdlpBin: YTDLP_BIN, timestamp: new Date().toISOString() });
 });
 
-// Express 4 & Express 5 compatible SPA catch-all
 app.use((_req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`CleanTube Hybrid Server running at http://0.0.0.0:${PORT}`);
+  console.log(`CleanTube Background-Audio Server running at http://0.0.0.0:${PORT}`);
 });

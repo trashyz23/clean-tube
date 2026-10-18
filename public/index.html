@@ -6,7 +6,7 @@
   <meta name="theme-color" content="#0f0f0f" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
-  <title>CleanTube Music — Player & Heavy Rotation</title>
+  <title>CleanTube Music — Background Player</title>
   <style>
     :root {
       --bg-primary: #0f0f0f;
@@ -173,16 +173,62 @@
       overflow: hidden;
       position: relative;
       box-shadow: 0 8px 30px rgba(0, 0, 0, 0.5);
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
     }
 
-    video,
-    #ytEmbedContainer,
-    #ytEmbedContainer iframe {
+    video {
       width: 100%;
       height: 100%;
-      display: block;
-      border: none;
+      object-fit: contain;
+      position: absolute;
+      inset: 0;
+      z-index: 1;
       background: #000;
+    }
+
+    .artwork-stage {
+      position: absolute;
+      inset: 0;
+      z-index: 2;
+      background: radial-gradient(circle at center, #222 0%, #0a0a0a 100%);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 1.25rem;
+      gap: 0.75rem;
+      text-align: center;
+    }
+
+    .artwork-stage.hidden {
+      display: none;
+    }
+
+    .artwork-stage img {
+      width: 150px;
+      height: 150px;
+      object-fit: cover;
+      border-radius: 14px;
+      box-shadow: 0 8px 28px rgba(0, 0, 0, 0.75);
+    }
+
+    .audio-bar-wrapper {
+      position: relative;
+      z-index: 5;
+      margin-top: auto;
+      background: rgba(15, 15, 15, 0.88);
+      backdrop-filter: blur(8px);
+      padding: 0.5rem 0.75rem;
+      border-top: 1px solid var(--bg-elevated);
+    }
+
+    /* Master Audio Element: Drives all sound so Android Chrome never pauses when screen locks */
+    #bgAudioPlayer {
+      width: 100%;
+      height: 40px;
+      display: block;
     }
 
     .meta-card {
@@ -220,15 +266,10 @@
       display: inline-flex;
       align-items: center;
       justify-content: center;
-      transition: transform 0.15s, color 0.15s;
     }
 
     .fav-btn.active {
       color: var(--heart);
-    }
-
-    .fav-btn:hover {
-      transform: scale(1.08);
     }
 
     .video-sub {
@@ -282,7 +323,6 @@
       font-weight: 500;
     }
 
-    /* Sidebar Tabs & Queue */
     .results-section {
       display: flex;
       flex-direction: column;
@@ -306,7 +346,6 @@
       font-size: 0.83rem;
       font-weight: 600;
       cursor: pointer;
-      transition: all 0.15s;
     }
 
     .tab-btn.active {
@@ -345,7 +384,6 @@
       border-radius: 10px;
       padding: 0.5rem;
       cursor: pointer;
-      transition: background 0.15s;
       border: 1px solid transparent;
     }
 
@@ -432,12 +470,6 @@
       padding: 0.4rem;
       border-radius: 50%;
       cursor: pointer;
-      line-height: 1;
-    }
-
-    .remove-btn:hover {
-      color: var(--danger);
-      background: rgba(255, 78, 69, 0.12);
     }
 
     .empty-state {
@@ -471,15 +503,24 @@
   </nav>
 
   <main class="container">
-    <!-- Left Column: Hybrid Media Player -->
+    <!-- Left Column: Master Audio + Synced Video Player -->
     <section class="player-section">
       <div class="video-stage">
-        <!-- Direct Stream Player (Used when direct stream is available) -->
-        <video id="videoPlayer" controls playsinline preload="metadata" style="display: none;"></video>
-        <audio id="bgAudioPlayer" preload="metadata" style="display: none;"></audio>
+        <!-- Muted video element synced to master audio when video is available -->
+        <video id="videoPlayer" muted playsinline preload="metadata"></video>
 
-        <!-- Embedded Player Container (Used automatically on Cloud/Render when datacenter IP is blocked) -->
-        <div id="ytEmbedContainer"></div>
+        <!-- Album Art Stage (Shown during Background-Ready Audio Mode) -->
+        <div class="artwork-stage" id="artworkStage">
+          <img id="overlayThumb" src="https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg" alt="Album Art" />
+          <div style="font-weight: 600; color: var(--accent); font-size: 0.9rem;">
+            🔒 Lock-Screen & Background Audio Ready
+          </div>
+        </div>
+
+        <!-- Master Audio Player: Always drives sound so Android Chrome never pauses on screen lock -->
+        <div class="audio-bar-wrapper">
+          <audio id="bgAudioPlayer" controls preload="auto"></audio>
+        </div>
       </div>
 
       <div class="meta-card">
@@ -489,13 +530,13 @@
         </div>
 
         <div class="video-sub">
-          <span id="currentUploader">Your most played tracks are saved automatically</span>
+          <span id="currentUploader">Works with screen off & minimized browser on Android</span>
           <span id="streamSourceBadge"></span>
         </div>
 
         <div class="controls-bar">
           <div class="toggles-group">
-            <label class="toggle-label" title="Play recommended/similar songs automatically when a track ends">
+            <label class="toggle-label">
               <input type="checkbox" id="autoplaySimilarToggle" checked />
               <span>✨ Autoplay Similar</span>
             </label>
@@ -510,7 +551,7 @@
       </div>
     </section>
 
-    <!-- Right Column: Most Played, Favorites, Similar & Search Results -->
+    <!-- Right Column: Most Played, Similar, Favorites & Search -->
     <aside class="results-section">
       <div class="tabs-bar">
         <button class="tab-btn active" data-tab="mostPlayed">🔥 Most Played</button>
@@ -531,7 +572,6 @@
     </aside>
   </main>
 
-  <script src="https://www.youtube.com/iframe_api"></script>
   <script src="/app.js"></script>
 </body>
 </html>
