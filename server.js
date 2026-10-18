@@ -11,10 +11,10 @@ const https = require('https');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Persistent storage path for Most Watched / Music Library
+// Persistent storage paths
 const DATA_DIR = path.join(__dirname, 'data');
 const LIBRARY_FILE = path.join(DATA_DIR, 'library.json');
-const COOKIES_FILE = path.join(__dirname, 'cookies.txt');
+const COOKIES_FILE = path.join(DATA_DIR, 'cookies.txt');
 
 if (!fs.existsSync(DATA_DIR)) {
   fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -23,12 +23,17 @@ if (!fs.existsSync(LIBRARY_FILE)) {
   fs.writeFileSync(LIBRARY_FILE, JSON.stringify({ tracks: {} }, null, 2), 'utf8');
 }
 
+// If YTDLP_COOKIES environment variable is set in Render dashboard, write it to data/cookies.txt on startup
+if (process.env.YTDLP_COOKIES && process.env.YTDLP_COOKIES.trim().length > 0) {
+  fs.writeFileSync(COOKIES_FILE, process.env.YTDLP_COOKIES.trim() + '\n', 'utf8');
+  console.log('[Startup] Loaded cookies.txt from YTDLP_COOKIES environment variable.');
+}
+
 app.use(cors());
 app.use(compression());
-app.use(express.json());
+app.use(express.json({ limit: '2mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 
-// Fallback Piped & Invidious instances (also dynamically updated at runtime)
 let PIPED_INSTANCES = [
   'https://api.piped.private.coffee',
   'https://pipedapi.kavin.rocks',
@@ -48,10 +53,6 @@ let INVIDIOUS_INSTANCES = [
 let YTDLP_BIN = 'yt-dlp';
 let ytDlpReadyPromise = null;
 
-/**
- * Automatically downloads standalone yt-dlp_linux binary to /tmp/yt-dlp
- * if Render's Node environment doesn't have yt-dlp pre-installed.
- */
 function ensureYtDlpBinary() {
   if (ytDlpReadyPromise) return ytDlpReadyPromise;
 
@@ -131,7 +132,6 @@ async function refreshPublicInstances() {
         .map((i) => i.api_url.replace(/\/$/, ''));
       if (discovered.length > 0) {
         PIPED_INSTANCES = [...new Set([...discovered.slice(0, 8), ...PIPED_INSTANCES])];
-        console.log(`[Startup] Loaded ${PIPED_INSTANCES.length} Piped instances.`);
       }
     }
   } catch (_) {}
@@ -152,7 +152,6 @@ async function refreshPublicInstances() {
         .map((entry) => entry[1].uri.replace(/\/$/, ''));
       if (discovered.length > 0) {
         INVIDIOUS_INSTANCES = [...new Set([...discovered.slice(0, 8), ...INVIDIOUS_INSTANCES])];
-        console.log(`[Startup] Loaded ${INVIDIOUS_INSTANCES.length} Invidious instances.`);
       }
     }
   } catch (_) {}
@@ -175,6 +174,14 @@ function writeLibrary(data) {
   fs.writeFileSync(LIBRARY_FILE, JSON.stringify(data, null, 2), 'utf8');
 }
 
+function hasValidCookiesFile() {
+  try {
+    return fs.existsSync(COOKIES_FILE) && fs.statSync(COOKIES_FILE).size > 20;
+  } catch (_) {
+    return false;
+  }
+}
+
 function extractVideoId(input) {
   if (!input || typeof input !== 'string') return null;
   const trimmed = input.trim();
@@ -187,16 +194,31 @@ function extractVideoId(input) {
   return null;
 }
 
+/**
+ * Builds yt-dlp arguments:
+ * - Uses Node.js (--js-runtimes node) to solve YouTube's JS/n-challenges.
+ * - Uses cookie-compatible clients (web_safari,mweb,web) when cookies.txt is present
+ *   (because ios/android_vr ignore cookies!).
+ */
 function buildYtDlpArgs(extraArgs) {
+  const cookiesPresent = hasValidCookiesFile();
+  const clientList = cookiesPresent
+    ? 'youtube:player_client=web_safari,mweb,web'
+    : 'youtube:player_client=web_safari,tv_simply,mweb,ios';
+
   const baseArgs = [
     '--no-warnings',
     '--geo-bypass',
+    '--js-runtimes',
+    'node',
     '--extractor-args',
-    'youtube:player_client=android_vr,ios,mweb,tv_embedded'
+    clientList
   ];
-  if (fs.existsSync(COOKIES_FILE)) {
+
+  if (cookiesPresent) {
     baseArgs.push('--cookies', COOKIES_FILE);
   }
+
   return [...baseArgs, ...extraArgs];
 }
 
@@ -219,9 +241,6 @@ function normalizePipedItems(items) {
     .filter((item) => Boolean(item.id) && item.duration > 0);
 }
 
-/**
- * Search via Piped -> Invidious -> YouTube InnerTube -> yt-dlp
- */
 async function searchWithPipedOrInvidious(query) {
   for (const instance of PIPED_INSTANCES) {
     try {
@@ -301,9 +320,6 @@ async function searchWithYtDlp(query, maxResults = 12) {
   });
 }
 
-/**
- * 1. Resolve streams via Piped API
- */
 async function resolveStreamWithPiped(videoId) {
   for (const instance of PIPED_INSTANCES) {
     try {
@@ -347,9 +363,6 @@ async function resolveStreamWithPiped(videoId) {
   throw new Error('All Piped stream instances failed');
 }
 
-/**
- * 2. Resolve streams via Invidious API (with ?local=true stream proxying)
- */
 async function resolveStreamWithInvidious(videoId) {
   for (const instance of INVIDIOUS_INSTANCES) {
     try {
@@ -414,97 +427,6 @@ async function resolveStreamWithInvidious(videoId) {
   throw new Error('All Invidious instances failed');
 }
 
-/**
- * 3. Direct YouTube Mobile InnerTube API Resolver (Fast, pure Node.js)
- */
-async function resolveStreamWithInnerTube(videoId) {
-  const clients = [
-    {
-      clientName: 'ANDROID_VR',
-      clientVersion: '1.60.19',
-      androidSdkVersion: 32,
-      userAgent:
-        'com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip',
-      osName: 'Android',
-      osVersion: '12L'
-    },
-    {
-      clientName: 'IOS',
-      clientVersion: '19.45.4',
-      deviceMake: 'Apple',
-      deviceModel: 'iPhone16,2',
-      userAgent: 'com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iOS 18_1_0 like Mac OS X;)',
-      osName: 'iPhone',
-      osVersion: '18.1.0.22B83'
-    }
-  ];
-
-  for (const client of clients) {
-    try {
-      const response = await fetchWithTimeout(
-        'https://www.youtube.com/youtubei/v1/player?prettyPrint=false',
-        {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'User-Agent': client.userAgent
-          },
-          body: JSON.stringify({
-            videoId,
-            context: {
-              client: {
-                hl: 'en',
-                gl: 'US',
-                ...client
-              }
-            },
-            contentCheckOk: true,
-            racyCheckOk: true
-          })
-        },
-        5000
-      );
-
-      if (!response.ok) continue;
-      const data = await response.json();
-
-      if (data.playabilityStatus?.status !== 'OK' || !data.streamingData) continue;
-
-      const formats = (data.streamingData.formats || []).filter((f) => f.url);
-      const adaptive = (data.streamingData.adaptiveFormats || []).filter(
-        (f) => f.url && f.mimeType && f.mimeType.startsWith('audio/')
-      );
-      adaptive.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
-
-      const rawVideoUrl = formats[formats.length - 1]?.url || null;
-      const rawAudioUrl = adaptive[0]?.url || rawVideoUrl;
-
-      if (!rawVideoUrl && !rawAudioUrl) continue;
-
-      const wrapProxy = (u) => (u ? `/api/proxy?url=${encodeURIComponent(u)}` : null);
-      const details = data.videoDetails || {};
-
-      return {
-        id: videoId,
-        title: details.title || 'Untitled Track',
-        uploader: details.author || 'Unknown Artist',
-        duration: parseInt(details.lengthSeconds || '0', 10),
-        thumbnailUrl: `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
-        videoUrl: wrapProxy(rawVideoUrl || rawAudioUrl),
-        audioUrl: wrapProxy(rawAudioUrl || rawVideoUrl),
-        hlsUrl: data.streamingData.hlsManifestUrl || null,
-        related: [],
-        source: `innertube (${client.clientName})`
-      };
-    } catch (_) {}
-  }
-
-  throw new Error('InnerTube clients could not resolve direct URL');
-}
-
-/**
- * 4. Fallback: Resolve streams via local yt-dlp binary
- */
 async function resolveStreamWithYtDlp(queryOrId) {
   await ensureYtDlpBinary();
   return new Promise((resolve, reject) => {
@@ -566,7 +488,7 @@ async function resolveStreamWithYtDlp(queryOrId) {
             audioUrl: wrapProxy(rawAudioUrl),
             hlsUrl: null,
             related: [],
-            source: 'yt-dlp (proxied)'
+            source: hasValidCookiesFile() ? 'yt-dlp (authenticated)' : 'yt-dlp (proxied)'
           });
         } catch (parseErr) {
           reject(parseErr);
@@ -576,9 +498,37 @@ async function resolveStreamWithYtDlp(queryOrId) {
   });
 }
 
-/**
- * Byte-Range Media Stream Proxy (/api/proxy?url=...)
- */
+// ============================================================================
+// Cookie Management Endpoints (For Cloud / Render Datacenter IP Auth)
+// ============================================================================
+
+app.get('/api/cookies/status', (_req, res) => {
+  res.json({ hasCookies: hasValidCookiesFile() });
+});
+
+app.post('/api/cookies', (req, res) => {
+  const { cookiesText } = req.body || {};
+  if (!cookiesText || typeof cookiesText !== 'string' || !cookiesText.includes('youtube.com')) {
+    return res.status(400).json({
+      error: 'Invalid cookies.txt content. Make sure it is in Netscape HTTP Cookie File format and includes youtube.com.'
+    });
+  }
+
+  fs.writeFileSync(COOKIES_FILE, cookiesText.trim() + '\n', 'utf8');
+  res.json({ success: true, hasCookies: true });
+});
+
+app.delete('/api/cookies', (_req, res) => {
+  if (fs.existsSync(COOKIES_FILE)) {
+    fs.unlinkSync(COOKIES_FILE);
+  }
+  res.json({ success: true, hasCookies: false });
+});
+
+// ============================================================================
+// Byte-Range Media Stream Proxy (/api/proxy?url=...)
+// ============================================================================
+
 app.get('/api/proxy', (req, res) => {
   const targetUrl = req.query.url;
   if (!targetUrl) return res.status(400).send('Missing url parameter');
@@ -805,39 +755,36 @@ app.get('/api/stream/:query', async (req, res) => {
   };
 
   if (videoId) {
-    // 1. Try Piped Instances
     try {
       const pipedData = await resolveStreamWithPiped(videoId);
       return res.json(attachLibraryMeta(pipedData));
     } catch (_) {}
 
-    // 2. Try Invidious Instances
     try {
       const invData = await resolveStreamWithInvidious(videoId);
       return res.json(attachLibraryMeta(invData));
     } catch (_) {}
-
-    // 3. Try Direct YouTube Mobile InnerTube API
-    try {
-      const innerTubeData = await resolveStreamWithInnerTube(videoId);
-      return res.json(attachLibraryMeta(innerTubeData));
-    } catch (_) {}
   }
 
-  // 4. Fallback to Local / Auto-Downloaded yt-dlp with Stream Proxy
   try {
     const fallbackData = await resolveStreamWithYtDlp(videoId || rawInput);
     return res.json(attachLibraryMeta(fallbackData));
   } catch (ytdlpError) {
     return res.status(502).json({
       error: `Stream resolution failed (${ytdlpError.message.slice(0, 140)})`,
-      details: ytdlpError.message
+      details: ytdlpError.message,
+      needsCookies: ytdlpError.message.includes('Sign in to confirm')
     });
   }
 });
 
 app.get('/api/health', (_req, res) => {
-  res.json({ status: 'ok', ytdlpBin: YTDLP_BIN, timestamp: new Date().toISOString() });
+  res.json({
+    status: 'ok',
+    ytdlpBin: YTDLP_BIN,
+    hasCookies: hasValidCookiesFile(),
+    timestamp: new Date().toISOString()
+  });
 });
 
 // Express 4 & Express 5 compatible SPA catch-all
