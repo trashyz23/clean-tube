@@ -449,20 +449,75 @@ app.get('/api/search', async (req, res) => {
   if (!query) return res.status(400).json({ error: 'Query required' });
 
   try {
-    // Выполняем поиск видео с помощью youtube-sr
-    const videos = await YouTube.search(query, { limit: 15, type: 'video' });
+    // Используем прямой публичный эндпоинт YouTube Music
+    const encodedQuery = encodeURIComponent(query);
+    const response = await fetch(`https://music.youtube.com/youtubei/v1/search?prettyPrint=false`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+      },
+      body: JSON.stringify({
+        context: {
+          client: {
+            clientName: 'WEB_MUSIC',
+            clientVersion: '1.20240402.01.00'
+          }
+        },
+        query: query
+      })
+    });
 
-    if (!videos || videos.length === 0) {
-      return res.json([]);
+    if (!response.ok) {
+      throw new Error(`YouTube API error: ${response.status}`);
     }
 
-    const results = videos.map(video => ({
-      id: video.id,
-      title: video.title,
-      thumbnail: video.thumbnail?.url || `https://i.ytimg.com/vi/${video.id}/hqdefault.jpg`,
-      uploaderName: video.channel?.name || 'YouTube',
-      duration: Math.floor((video.duration || 0) / 1000)
-    })).filter(item => item.id);
+    const data = await response.json();
+
+    // Парсим результаты из структуры ответа YouTube Music
+    const contents = data.contents?.tabbedSearchResultsRenderer?.tabs?.[0]?.tabRenderer?.content?.sectionListRenderer?.contents;
+
+    let items = [];
+    if (contents) {
+      for (const section of contents) {
+        const musicShelf = section.musicShelfRenderer || section.musicCardShelfRenderer;
+        if (musicShelf && musicShelf.contents) {
+          items = musicShelf.contents;
+          break;
+        }
+      }
+    }
+
+    const results = [];
+    for (const item of items) {
+      const renderer = item.musicResponsiveListItemRenderer;
+      if (!renderer) continue;
+
+      const title = renderer.flexColumns?.[0]?.musicResponsiveListItemFlexColumnRenderer?.text?.runs?.[0]?.text;
+      const videoId = renderer.playlistItemData?.videoId || renderer.overlay?.musicItemThumbnailOverlayRenderer?.content?.playNavigationEndpoint?.watchEndpoint?.videoId;
+
+      let uploaderName = '';
+      const runs = renderer.flexColumns?.[1]?.musicResponsiveListItemFlexColumnRenderer?.text?.runs;
+      if (runs && runs.length > 0) {
+        uploaderName = runs.map(r => r.text).join(' ');
+      }
+
+      let thumbnail = '';
+      const thumbs = renderer.thumbnail?.musicThumbnailRenderer?.thumbnail?.thumbnails;
+      if (thumbs && thumbs.length > 0) {
+        thumbnail = thumbs[thumbs.length - 1].url;
+      }
+
+      if (videoId && title) {
+        results.push({
+          id: videoId,
+          title: title,
+          thumbnail: thumbnail || `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
+          uploaderName: uploaderName || 'YouTube Music',
+          duration: 0
+        });
+      }
+    }
 
     return res.json(results);
   } catch (err) {
