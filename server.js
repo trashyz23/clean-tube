@@ -2,7 +2,7 @@ const express = require('express');
 const compression = require('compression');
 const cors = require('cors');
 const fetch = globalThis.fetch || require('node-fetch');
-const { execFile, spawn } = require('child_process');
+const { execFile } = require('child_process');
 const { Readable } = require('stream');
 const fs = require('fs');
 const os = require('os');
@@ -26,7 +26,6 @@ app.use(compression());
 app.use(express.json({ limit: '2mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 
-// Full 2026 Official Piped Instance List
 const PIPED_INSTANCES = [
   'https://api.piped.private.coffee',
   'https://pipedapi.kavin.rocks',
@@ -52,13 +51,6 @@ const INVIDIOUS_INSTANCES = [
   'https://invidious.tiekoetter.com',
   'https://invidious.f5.si',
   'https://inv.zoomerville.com'
-];
-
-// High-speed 320kbps Music CDN APIs (Never block Render/AWS datacenter IPs)
-const SAAVN_API_INSTANCES = [
-  'https://saavn.dev/api/search/songs',
-  'https://saavn.sumit.co/api/search/songs',
-  'https://jiosaavn-api-privatecvc2.vercel.app/search/songs'
 ];
 
 let YTDLP_BIN = 'yt-dlp';
@@ -136,7 +128,7 @@ function extractVideoId(input) {
   return null;
 }
 
-async function fetchWithTimeout(url, options = {}, timeoutMs = 4000) {
+async function fetchWithTimeout(url, options = {}, timeoutMs = 4200) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
@@ -444,15 +436,106 @@ async function fetchVideoMetadataFast(videoId) {
 }
 
 // ============================================================================
-// Multi-Engine Direct Audio Stream Resolution (For Android Chrome Background Play)
+// Exact YouTube VideoID Stream Resolvers (Never Substitutes Different Songs)
 // ============================================================================
 
 /**
- * Engine 1: Parallel 15-Piped + 6-Invidious Direct Stream Resolution
+ * Engine 1: Direct YouTube InnerTube IOS (20.10.4, no params) & ANDROID (20.10.38)
+ * Calls youtubei.googleapis.com and proxies through /api/proxy with matching client User-Agent.
+ */
+async function resolveDirectViaInnerTubeMobile(videoId) {
+  const clients = [
+    {
+      clientName: 'IOS',
+      clientVersion: '20.10.4',
+      userAgent: 'com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)',
+      hl: 'en',
+      gl: 'US'
+    },
+    {
+      clientName: 'ANDROID',
+      clientVersion: '20.10.38',
+      androidSdkVersion: 34,
+      userAgent: 'com.google.android.youtube/20.10.38 (Linux; U; Android 14) gzip',
+      hl: 'en',
+      gl: 'US'
+    }
+  ];
+
+  for (const client of clients) {
+    try {
+      const res = await fetchWithTimeout(
+        'https://youtubei.googleapis.com/youtubei/v1/player?prettyPrint=false',
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'User-Agent': client.userAgent
+          },
+          body: JSON.stringify({
+            videoId,
+            context: {
+              client: {
+                clientName: client.clientName,
+                clientVersion: client.clientVersion,
+                ...(client.androidSdkVersion ? { androidSdkVersion: client.androidSdkVersion } : {}),
+                hl: client.hl,
+                gl: client.gl
+              }
+            },
+            racyCheckOk: true,
+            contentCheckOk: true
+          })
+        },
+        4000
+      );
+
+      if (!res.ok) continue;
+      const data = await res.json();
+      if (data.playabilityStatus?.status !== 'OK' || !data.streamingData) continue;
+
+      const muxed = (data.streamingData.formats || []).filter((f) => f.url);
+      const audio = (data.streamingData.adaptiveFormats || []).filter(
+        (f) => f.url && f.mimeType && f.mimeType.startsWith('audio/')
+      );
+
+      // Prefer audio/mp4 (itag 140) for reliable mobile duration & seeking
+      audio.sort((a, b) => {
+        const aMp4 = (a.mimeType || '').includes('mp4') ? 1000000 : 0;
+        const bMp4 = (b.mimeType || '').includes('mp4') ? 1000000 : 0;
+        return bMp4 + (b.bitrate || 0) - (aMp4 + (a.bitrate || 0));
+      });
+
+      const rawAudio = audio[0]?.url || muxed[0]?.url || null;
+      const rawVideo = muxed[muxed.length - 1]?.url || null;
+      if (!rawAudio) continue;
+
+      const wrapProxy = (u) => (u ? `/api/proxy?url=${encodeURIComponent(u)}` : null);
+      const details = data.videoDetails || {};
+
+      return {
+        id: videoId,
+        title: details.title || 'Untitled Track',
+        uploader: details.author || 'Unknown Artist',
+        duration: parseInt(details.lengthSeconds || '0', 10),
+        thumbnailUrl: `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
+        videoUrl: wrapProxy(rawVideo),
+        audioUrl: wrapProxy(rawAudio),
+        playbackMode: 'direct',
+        source: `youtube-${client.clientName.toLowerCase()}`
+      };
+    } catch (_) {}
+  }
+
+  throw new Error('InnerTube mobile clients did not return direct URLs');
+}
+
+/**
+ * Engine 2: Parallel 15-Piped + 6-Invidious Direct Stream Resolution for exact videoId
  */
 async function resolveDirectViaInstances(videoId) {
   const pipedTasks = PIPED_INSTANCES.map(async (instance) => {
-    const res = await fetchWithTimeout(`${instance}/streams/${encodeURIComponent(videoId)}`, {}, 4200);
+    const res = await fetchWithTimeout(`${instance}/streams/${encodeURIComponent(videoId)}`, {}, 4500);
     if (!res.ok) throw new Error('Piped non-200');
     const data = await res.json();
 
@@ -474,7 +557,7 @@ async function resolveDirectViaInstances(videoId) {
       uploader: data.uploader || 'Unknown Artist',
       duration: data.duration || 0,
       thumbnailUrl: data.thumbnailUrl || `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
-      videoUrl: videoUrl || null,
+      videoUrl,
       audioUrl,
       playbackMode: 'direct',
       source: `piped (${new URL(instance).hostname})`
@@ -485,7 +568,7 @@ async function resolveDirectViaInstances(videoId) {
     const res = await fetchWithTimeout(
       `${instance}/api/v1/videos/${encodeURIComponent(videoId)}`,
       {},
-      4200
+      4500
     );
     if (!res.ok) throw new Error('Invidious non-200');
     const data = await res.json();
@@ -522,117 +605,76 @@ async function resolveDirectViaInstances(videoId) {
 }
 
 /**
- * Engine 2: High-Speed 320kbps Music CDN Resolver (JioSaavn & Audius APIs)
- * Works 100% on Render/AWS Datacenter IPs in ~300ms with zero cookies or bot blocks!
+ * Engine 3: yt-dlp Exact YouTube VideoID Resolver (With proper byte-range proxy, NOT live stdout)
  */
-async function resolveDirectAudioViaMusicCdn(videoId, meta) {
-  const cleanArtist = (meta.uploader || '')
-    .replace(/\s*(-|Topic|VEVO|Official|Music|Records)\s*/gi, ' ')
-    .trim();
-  const coreTitle = getCoreSongTitle(meta.title, meta.uploader) || meta.title;
-  const searchQuery = `${cleanArtist} ${coreTitle}`.trim();
+async function resolveDirectViaYtDlp(videoId) {
+  await ensureYtDlpBinary();
+  return new Promise((resolve, reject) => {
+    const url = `https://www.youtube.com/watch?v=${videoId}`;
+    const args = [
+      '--no-warnings',
+      '--no-playlist',
+      '--force-ipv4',
+      '--js-runtimes',
+      'node',
+      '--extractor-args',
+      'youtube:player_client=ios,web_safari,tv_simply,mweb',
+      '--dump-json',
+      url
+    ];
 
-  // 1. Try JioSaavn 320kbps AAC (.mp4) API Mirrors in parallel
-  const saavnTasks = SAAVN_API_INSTANCES.map(async (endpoint) => {
-    const url = `${endpoint}?query=${encodeURIComponent(searchQuery)}&limit=5`;
-    const res = await fetchWithTimeout(url, {}, 3800);
-    if (!res.ok) throw new Error('Saavn API non-200');
-    const json = await res.json();
+    execFile(YTDLP_BIN, args, { maxBuffer: 1024 * 1024 * 15, timeout: 14000 }, (err, stdout) => {
+      if (err) return reject(err);
+      try {
+        const data = JSON.parse(stdout.trim().split('\n')[0]);
+        const formats = data.formats || [];
 
-    const results = json?.data?.results || json?.results || [];
-    if (!Array.isArray(results) || results.length === 0) throw new Error('No Saavn match');
+        const muxed = formats.filter(
+          (f) =>
+            f.vcodec &&
+            f.vcodec !== 'none' &&
+            f.acodec &&
+            f.acodec !== 'none' &&
+            f.url &&
+            !String(f.protocol || '').includes('m3u8')
+        );
+        const audio = formats.filter(
+          (f) =>
+            (!f.vcodec || f.vcodec === 'none') &&
+            f.acodec &&
+            f.acodec !== 'none' &&
+            f.url &&
+            !String(f.protocol || '').includes('m3u8')
+        );
 
-    const song = results[0];
-    const dlList = song.downloadUrl || song.download_url || [];
-    if (!Array.isArray(dlList) || dlList.length === 0) throw new Error('No downloadUrl list');
+        const rawVideo = muxed[muxed.length - 1]?.url || null;
+        const rawAudio = audio[audio.length - 1]?.url || rawVideo;
+        if (!rawAudio) return reject(new Error('No seekable audio stream found'));
 
-    // Pick highest quality (320kbps or 160kbps .mp4)
-    const best = dlList[dlList.length - 1];
-    const rawAudioUrl = best?.url || best?.link || (typeof best === 'string' ? best : null);
-    if (!rawAudioUrl) throw new Error('Empty audio URL');
+        const wrapProxy = (u) => (u ? `/api/proxy?url=${encodeURIComponent(u)}` : null);
 
-    return {
-      id: videoId,
-      title: meta.title || song.name || 'Untitled Track',
-      uploader: meta.uploader || song.primaryArtists || 'Unknown Artist',
-      duration: parseInt(song.duration || '0', 10) || meta.duration || 0,
-      thumbnailUrl: meta.thumbnailUrl || `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
-      videoUrl: null,
-      audioUrl: `/api/proxy?url=${encodeURIComponent(rawAudioUrl)}`,
-      playbackMode: 'direct',
-      source: '320kbps-music-cdn'
-    };
+        resolve({
+          id: videoId,
+          title: data.title || 'Untitled Track',
+          uploader: data.uploader || data.channel || 'Unknown Artist',
+          duration: data.duration || 0,
+          thumbnailUrl: `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
+          videoUrl: wrapProxy(rawVideo),
+          audioUrl: wrapProxy(rawAudio),
+          playbackMode: 'direct',
+          source: 'yt-dlp'
+        });
+      } catch (e) {
+        reject(e);
+      }
+    });
   });
-
-  // 2. Also try Audius Decentralized Music Stream API
-  const audiusTask = (async () => {
-    const searchUrl = `https://discoveryprovider.audius.co/v1/tracks/search?query=${encodeURIComponent(
-      searchQuery
-    )}&app_name=CleanTube`;
-    const res = await fetchWithTimeout(searchUrl, {}, 4000);
-    if (!res.ok) throw new Error('Audius search failed');
-    const json = await res.json();
-    const track = json?.data?.[0];
-    if (!track || !track.id) throw new Error('No Audius match');
-
-    const streamUrl = `https://discoveryprovider.audius.co/v1/tracks/${encodeURIComponent(
-      track.id
-    )}/stream?app_name=CleanTube`;
-
-    return {
-      id: videoId,
-      title: meta.title || track.title || 'Untitled Track',
-      uploader: meta.uploader || track.user?.name || 'Unknown Artist',
-      duration: track.duration || 0,
-      thumbnailUrl: meta.thumbnailUrl || `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
-      videoUrl: null,
-      audioUrl: `/api/proxy?url=${encodeURIComponent(streamUrl)}`,
-      playbackMode: 'direct',
-      source: 'audius-cdn'
-    };
-  })();
-
-  return Promise.any([...saavnTasks, audiusTask]);
 }
 
-/**
- * Engine 3: Live yt-dlp Audio Stream Pipe (/api/live-audio/:id)
- * Streams audio directly from yt-dlp stdout to the <audio> element.
- */
-app.get('/api/live-audio/:id', async (req, res) => {
-  const videoId = extractVideoId(req.params.id);
-  const searchQuery = (req.query.q || '').trim();
-  if (!videoId && !searchQuery) return res.status(400).send('Missing track info');
-
-  await ensureYtDlpBinary();
-
-  const target = searchQuery ? `scsearch1:${searchQuery}` : `https://www.youtube.com/watch?v=${videoId}`;
-  const args = [
-    '--no-warnings',
-    '--no-playlist',
-    '--force-ipv4',
-    '-f',
-    'bestaudio/best',
-    '-o',
-    '-',
-    target
-  ];
-
-  res.setHeader('Content-Type', 'audio/mpeg');
-  res.setHeader('Cache-Control', 'no-cache');
-
-  const proc = spawn(YTDLP_BIN, args, { stdio: ['ignore', 'pipe', 'ignore'] });
-  proc.stdout.pipe(res);
-
-  req.on('close', () => {
-    try {
-      proc.kill('SIGKILL');
-    } catch (_) {}
-  });
-});
-
 // ============================================================================
-// Byte-Range Stream Proxy (/api/proxy?url=...)
+// Client-Aware Byte-Range Stream Proxy (/api/proxy?url=...)
+// Matches User-Agent to the googlevideo "c=" parameter and preserves Content-Length
+// so the <audio> element never treats the song as a "LIVE" broadcast!
 // ============================================================================
 
 app.get('/api/proxy', async (req, res) => {
@@ -640,12 +682,30 @@ app.get('/api/proxy', async (req, res) => {
   if (!targetUrl) return res.status(400).send('Missing url parameter');
 
   try {
+    const parsed = new URL(targetUrl);
+    const clientParam = (parsed.searchParams.get('c') || '').toUpperCase();
+
+    let userAgent =
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36';
+    if (clientParam === 'IOS') {
+      userAgent = 'com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)';
+    } else if (clientParam === 'ANDROID') {
+      userAgent = 'com.google.android.youtube/20.10.38 (Linux; U; Android 14) gzip';
+    } else if (clientParam === 'ANDROID_VR') {
+      userAgent =
+        'com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip';
+    }
+
     const headers = {
-      'User-Agent':
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36'
+      'User-Agent': userAgent,
+      Accept: '*/*',
+      'Accept-Encoding': 'identity'
     };
+
     if (req.headers.range) {
       headers.Range = req.headers.range;
+    } else {
+      headers.Range = 'bytes=0-';
     }
 
     const upstream = await fetch(targetUrl, { headers, redirect: 'follow' });
@@ -662,6 +722,10 @@ app.get('/api/proxy', async (req, res) => {
       const val = upstream.headers.get(h);
       if (val) res.setHeader(h, val);
     });
+
+    if (!res.getHeader('accept-ranges')) {
+      res.setHeader('accept-ranges', 'bytes');
+    }
 
     if (!upstream.body) return res.end();
     const nodeStream = Readable.fromWeb(upstream.body);
@@ -813,26 +877,30 @@ app.get('/api/stream/:query', async (req, res) => {
     return streamData;
   };
 
-  // Fetch fast metadata and run Direct Instance + 320kbps Music CDN resolvers
-  const meta = await fetchVideoMetadataFast(videoId);
-
+  // 1. Try Direct YouTube InnerTube Mobile (IOS 20.10.4) & Piped/Invidious Instances in parallel
   try {
     const directData = await Promise.any([
-      resolveDirectViaInstances(videoId),
-      resolveDirectAudioViaMusicCdn(videoId, meta)
+      resolveDirectViaInnerTubeMobile(videoId),
+      resolveDirectViaInstances(videoId)
     ]);
     return res.json(await attachLibraryAndRelated(directData));
   } catch (_) {}
 
-  // Fallback to live yt-dlp audio stream pipe + embed backup
-  const cleanSearch = `${meta.uploader} ${meta.title}`.trim();
+  // 2. Try yt-dlp for the exact videoId
+  try {
+    const ytdlpData = await resolveDirectViaYtDlp(videoId);
+    return res.json(await attachLibraryAndRelated(ytdlpData));
+  } catch (_) {}
+
+  // 3. Final fallback if all direct stream extractors are blocked
+  const meta = await fetchVideoMetadataFast(videoId);
   return res.json(
     await attachLibraryAndRelated({
       ...meta,
       videoUrl: null,
-      audioUrl: `/api/live-audio/${encodeURIComponent(videoId)}?q=${encodeURIComponent(cleanSearch)}`,
-      playbackMode: 'direct',
-      source: 'live-audio-stream'
+      audioUrl: null,
+      playbackMode: 'embed',
+      source: 'youtube-embed-fallback'
     })
   );
 });
@@ -846,5 +914,5 @@ app.use((_req, res) => {
 });
 
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`CleanTube Multi-CDN Audio Server running at http://0.0.0.0:${PORT}`);
+  console.log(`CleanTube Exact-Stream Server running at http://0.0.0.0:${PORT}`);
 });

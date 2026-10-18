@@ -25,10 +25,20 @@ const playAllBtn = document.getElementById('playAllBtn');
 const shuffleBtn = document.getElementById('shuffleBtn');
 const resultsList = document.getElementById('resultsList');
 
+const BROWSER_PIPED_INSTANCES = [
+  'https://api.piped.private.coffee',
+  'https://pipedapi.kavin.rocks',
+  'https://pipedapi-libre.kavin.rocks',
+  'https://piped-api.privacy.com.de',
+  'https://pipedapi.adminforge.de',
+  'https://api.piped.yt',
+  'https://pipedapi.drgns.space'
+];
+
 // Application State
 let currentStream = null;
 let activeTab = 'mostPlayed';
-let activeEngine = 'direct'; // 'direct' | 'embed'
+let activeEngine = 'direct';
 let ytPlayer = null;
 let ytApiReady = false;
 
@@ -92,6 +102,46 @@ function ensureYtPlayer(videoId) {
       }, 150);
     }
   });
+}
+
+/**
+ * Parallel Browser-Side Stream Resolver (Uses your phone's residential IP in parallel with a 3s timeout)
+ */
+async function resolveExactVideoInBrowser(videoId) {
+  const tasks = BROWSER_PIPED_INSTANCES.map(async (instance) => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 3200);
+    try {
+      const res = await fetch(`${instance}/streams/${encodeURIComponent(videoId)}`, {
+        signal: controller.signal
+      });
+      clearTimeout(timer);
+      if (!res.ok) throw new Error('Non-200');
+      const data = await res.json();
+
+      const muxed = (data.videoStreams || []).filter((s) => !s.videoOnly && s.url);
+      const audio = (data.audioStreams || []).filter((s) => s.url);
+      audio.sort((a, b) => {
+        const aM4a = (a.mimeType || '').includes('mp4') ? 1000000 : 0;
+        const bM4a = (b.mimeType || '').includes('mp4') ? 1000000 : 0;
+        return bM4a + (b.bitrate || 0) - (aM4a + (a.bitrate || 0));
+      });
+
+      const audioUrl = audio[0]?.url || muxed[0]?.url;
+      if (!audioUrl) throw new Error('No audioUrl');
+
+      return {
+        audioUrl,
+        videoUrl: muxed[0]?.url || null,
+        source: `browser-direct (${new URL(instance).hostname})`
+      };
+    } catch (e) {
+      clearTimeout(timer);
+      throw e;
+    }
+  });
+
+  return Promise.any(tasks);
 }
 
 function getCoreTitle(rawTitle = '', uploader = '') {
@@ -418,7 +468,7 @@ async function performSearch(query) {
 
 async function loadAndPlayStream(queryOrId) {
   searchBtn.disabled = true;
-  playbackStatus.textContent = 'Loading background audio stream...';
+  playbackStatus.textContent = 'Loading track...';
 
   try {
     bgAudioPlayer.pause();
@@ -430,6 +480,16 @@ async function loadAndPlayStream(queryOrId) {
 
     if (!response.ok) {
       throw new Error(data.error || 'Could not load track');
+    }
+
+    // If the server's cloud IP couldn't get a direct URL, try parallel browser resolution using user's residential IP
+    if (!data.audioUrl && data.id) {
+      try {
+        const browserStream = await resolveExactVideoInBrowser(data.id);
+        data.audioUrl = browserStream.audioUrl;
+        data.videoUrl = browserStream.videoUrl;
+        data.source = browserStream.source;
+      } catch (_) {}
     }
 
     currentStream = data;
@@ -484,17 +544,7 @@ async function loadAndPlayStream(queryOrId) {
       playbackStatus.textContent = 'Playing';
     }
   } catch (err) {
-    // If direct audio stream fails on a rare non-music clip, fallback to embed instead of stopping
-    if (currentStream && currentStream.id) {
-      activeEngine = 'embed';
-      artworkStage.classList.add('hidden');
-      audioBarWrapper.style.display = 'none';
-      ytEmbedContainer.style.display = 'block';
-      await ensureYtPlayer(currentStream.id);
-      playbackStatus.textContent = 'Playing (Embed Fallback)';
-    } else {
-      playbackStatus.textContent = `Error: ${err.message}`;
-    }
+    playbackStatus.textContent = `Error: ${err.message}`;
   } finally {
     searchBtn.disabled = false;
   }
